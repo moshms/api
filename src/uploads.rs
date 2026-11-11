@@ -1,0 +1,514 @@
+use std::path::Path;
+
+use axum::body::Body;
+use axum::extract::{Path as AxumPath, Query, State};
+use axum::http::header::{CACHE_CONTROL, LOCATION};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use base64::Engine;
+use bytes::Bytes;
+use futures_util::StreamExt;
+use mc_core::{CoreError, Result};
+use mc_db::repos::libraries;
+use mc_db::repos::uploads::{self, UploadRecord};
+use mc_scanner::ScanMode;
+use mc_storage::Key;
+use serde::Deserialize;
+use tokio::io::AsyncWriteExt;
+use uuid::Uuid;
+
+use crate::auth;
+use crate::error::ApiError;
+use crate::state::AppState;
+
+const TUS_VERSION: &str = "1.0.0";
+
+#[derive(Debug, Deserialize)]
+pub struct CreateUploadQuery {
+    pub library_id: Option<Uuid>,
+}
+
+pub async fn options(State(state): State<AppState>) -> Response {
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    insert_tus_headers(&mut response, None, None);
+    response.headers_mut().insert(
+        HeaderName::from_static("tus-version"),
+        HeaderValue::from_static(TUS_VERSION),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("tus-extension"),
+        HeaderValue::from_static("creation,termination"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("tus-max-size"),
+        HeaderValue::from_str(&state.max_upload_bytes.to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("0")),
+    );
+
+    response
+}
+
+pub async fn create(
+    State(state): State<AppState>,
+    Query(query): Query<CreateUploadQuery>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let user = auth::authenticate(&state, &headers).await?;
+
+    if !user.role.can_upload() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "uploader or administrator role required",
+        ));
+    }
+
+    if header(&headers, "tus-resumable") != Some(TUS_VERSION) {
+        return Err(ApiError::new(
+            StatusCode::PRECONDITION_FAILED,
+            "unsupported tus version",
+        ));
+    }
+
+    let size = header(&headers, "upload-length")
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Upload-Length is required"))?;
+
+    if size > state.max_upload_bytes {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "upload is too large",
+        ));
+    }
+
+    let library = resolve_library(&state, query.library_id).await?;
+
+    if state
+        .registry
+        .read()
+        .await
+        .storage_for_library(library.id)
+        .is_none()
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "library storage is unavailable",
+        ));
+    }
+
+    let filename = metadata_filename(&headers).unwrap_or_else(|| "upload.bin".to_owned());
+    let upload_id = Uuid::now_v7();
+    let staging_key = format!("{upload_id}.part");
+    let staging_path = state.staging_path.join(&staging_key);
+
+    tokio::fs::File::create(&staging_path)
+        .await
+        .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+
+    let upload = match uploads::create(
+        &state.pool,
+        user.id,
+        library.id,
+        &filename,
+        i64::try_from(size).unwrap_or(i64::MAX),
+        &staging_key,
+    )
+    .await
+    {
+        Ok(upload) => upload,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&staging_path).await;
+            return Err(ApiError::from(error));
+        }
+    };
+
+    let mut response = StatusCode::CREATED.into_response();
+    response.headers_mut().insert(
+        LOCATION,
+        HeaderValue::from_str(&format!("/tus/{}", upload.id))
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "invalid location"))?,
+    );
+    insert_tus_headers(&mut response, Some(0), Some(size));
+
+    Ok(response)
+}
+
+pub async fn head(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<Uuid>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let user = auth::authenticate(&state, &headers).await?;
+    let upload = load_upload(&state, id).await?;
+    authorize_upload(&user, &upload)?;
+
+    let mut response = StatusCode::OK.into_response();
+    insert_tus_headers(
+        &mut response,
+        Some(upload.offset.max(0) as u64),
+        Some(upload.size.max(0) as u64),
+    );
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+
+    Ok(response)
+}
+
+pub async fn patch(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<Uuid>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, ApiError> {
+    let user = auth::authenticate(&state, &headers).await?;
+
+    if !header(&headers, "content-type")
+        .is_some_and(|value| value.starts_with("application/offset+octet-stream"))
+    {
+        return Err(ApiError::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Content-Type must be application/offset+octet-stream",
+        ));
+    }
+
+    let requested_offset = header(&headers, "upload-offset")
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Upload-Offset is required"))?;
+
+    let _guard = state.upload_lock.lock().await;
+    let upload = load_upload(&state, id).await?;
+    authorize_upload(&user, &upload)?;
+
+    let size = upload.size.max(0) as u64;
+    let offset = upload.offset.max(0) as u64;
+
+    if upload.status == "complete" {
+        let mut response = StatusCode::NO_CONTENT.into_response();
+        insert_tus_headers(&mut response, Some(size), Some(size));
+        return Ok(response);
+    }
+
+    if offset == size {
+        if let Err(error) = complete_upload(&state, &upload).await {
+            let _ =
+                uploads::finish(&state.pool, upload.id, "failed", Some(&error.to_string())).await;
+            return Err(ApiError::from(error));
+        }
+
+        let mut response = StatusCode::NO_CONTENT.into_response();
+        insert_tus_headers(&mut response, Some(size), Some(size));
+        return Ok(response);
+    }
+
+    if requested_offset != offset {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            format!("upload offset mismatch: expected {offset}"),
+        ));
+    }
+
+    let staging_path = state.staging_path.join(&upload.staging_key);
+    let mut file = tokio::fs::OpenOptions::new()
+        .append(true)
+        .open(&staging_path)
+        .await
+        .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+
+    let mut stream = body.into_data_stream();
+    let mut written = 0_u64;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("read upload body: {error}"),
+            )
+        })?;
+
+        if offset + written + chunk.len() as u64 > size {
+            let _ = file.set_len(offset).await;
+            return Err(ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "upload exceeds declared size",
+            ));
+        }
+
+        file.write_all(&chunk)
+            .await
+            .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        written += chunk.len() as u64;
+    }
+
+    file.flush()
+        .await
+        .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    drop(file);
+
+    let new_offset = offset + written;
+
+    if let Err(error) = uploads::update_offset(
+        &state.pool,
+        upload.id,
+        i64::try_from(new_offset).unwrap_or(i64::MAX),
+    )
+    .await
+    {
+        if let Ok(file) = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&staging_path)
+            .await
+        {
+            let _ = file.set_len(offset).await;
+        }
+        return Err(ApiError::from(error));
+    }
+
+    if new_offset == size {
+        if let Err(error) = complete_upload(&state, &upload).await {
+            let _ =
+                uploads::finish(&state.pool, upload.id, "failed", Some(&error.to_string())).await;
+            return Err(ApiError::from(error));
+        }
+    }
+
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    insert_tus_headers(&mut response, Some(new_offset), Some(size));
+
+    Ok(response)
+}
+
+pub async fn delete(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<Uuid>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let user = auth::authenticate(&state, &headers).await?;
+    let upload = load_upload(&state, id).await?;
+    authorize_upload(&user, &upload)?;
+
+    let staging_path = state.staging_path.join(&upload.staging_key);
+    let _ = tokio::fs::remove_file(&staging_path).await;
+    uploads::delete(&state.pool, id).await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<axum::Json<Vec<UploadRecord>>, ApiError> {
+    let user = auth::authenticate(&state, &headers).await?;
+    Ok(axum::Json(
+        uploads::list_for_user(&state.pool, user.id).await?,
+    ))
+}
+
+async fn load_upload(state: &AppState, id: Uuid) -> Result<UploadRecord, ApiError> {
+    uploads::get(&state.pool, id)
+        .await?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "upload not found"))
+}
+
+fn authorize_upload(user: &auth::AuthUser, upload: &UploadRecord) -> Result<(), ApiError> {
+    if user.role.is_admin() || upload.user_id == user.id {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "upload belongs to another user",
+        ))
+    }
+}
+
+async fn resolve_library(
+    state: &AppState,
+    library_id: Option<Uuid>,
+) -> Result<mc_db::repos::libraries::LibraryRecord, ApiError> {
+    if let Some(library_id) = library_id {
+        return libraries::get(&state.pool, library_id)
+            .await?
+            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "library not found"));
+    }
+
+    let libraries = libraries::list(&state.pool).await?;
+    libraries
+        .iter()
+        .find(|library| library.is_import_target)
+        .or_else(|| libraries.first())
+        .cloned()
+        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "no libraries configured"))
+}
+
+async fn complete_upload(state: &AppState, upload: &UploadRecord) -> Result<()> {
+    let key = finalize(state, upload).await?;
+    uploads::finish(&state.pool, upload.id, "complete", None).await?;
+
+    let payload = serde_json::json!({
+        "upload_id": upload.id,
+        "library_id": upload.library_id,
+        "source_key": key.as_str(),
+        "filename": upload.filename,
+    });
+
+    if let Err(error) = mc_jobs::enqueue(&state.pool, "import", payload).await {
+        tracing::warn!(%error, "failed to enqueue import job");
+    }
+
+    Ok(())
+}
+
+async fn finalize(state: &AppState, upload: &UploadRecord) -> Result<Key> {
+    let library = libraries::get(&state.pool, upload.library_id)
+        .await?
+        .ok_or_else(|| CoreError::not_found("library", upload.library_id))?;
+    let storage = state
+        .registry
+        .read()
+        .await
+        .storage_for_library(library.id)
+        .ok_or_else(|| CoreError::Unavailable("library storage is unavailable".to_owned()))?;
+
+    let filename = sanitize_filename(&upload.filename);
+    let mut key = Key::new(format!("uploads/{}/{}", upload.user_id, filename))?;
+
+    match storage.stat(&key).await {
+        Ok(_) => {
+            key = Key::new(format!(
+                "uploads/{}/{}-{}",
+                upload.user_id, upload.id, filename
+            ))?;
+        }
+        Err(CoreError::NotFound { .. }) => {}
+        Err(error) => return Err(error),
+    }
+
+    let staging_path = state.staging_path.join(&upload.staging_key);
+
+    if let Some(destination) = storage.local_path(&key) {
+        if let Some(parent) = destination.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|error| {
+                CoreError::Unavailable(format!("create upload directory: {error}"))
+            })?;
+        }
+
+        if tokio::fs::rename(&staging_path, &destination)
+            .await
+            .is_err()
+        {
+            let data = tokio::fs::read(&staging_path)
+                .await
+                .map_err(|error| CoreError::Unavailable(format!("read staging file: {error}")))?;
+            storage.write(&key, Bytes::from(data)).await?;
+            let _ = tokio::fs::remove_file(&staging_path).await;
+        }
+    } else {
+        let data = tokio::fs::read(&staging_path)
+            .await
+            .map_err(|error| CoreError::Unavailable(format!("read staging file: {error}")))?;
+        storage.write(&key, Bytes::from(data)).await?;
+        let _ = tokio::fs::remove_file(&staging_path).await;
+    }
+
+    let scanner = state.scanner.clone();
+    let storage = storage.clone();
+    let library_name = library.name.clone();
+    tokio::spawn(async move {
+        match scanner
+            .scan_library(&library, storage, ScanMode::Full)
+            .await
+        {
+            Ok(stats) => {
+                tracing::info!(library = %library_name, ?stats, "upload scan finished")
+            }
+            Err(error) => {
+                tracing::error!(library = %library_name, %error, "upload scan failed")
+            }
+        }
+    });
+
+    Ok(key)
+}
+
+fn insert_tus_headers(response: &mut Response, offset: Option<u64>, length: Option<u64>) {
+    response.headers_mut().insert(
+        HeaderName::from_static("tus-resumable"),
+        HeaderValue::from_static(TUS_VERSION),
+    );
+
+    if let Some(offset) = offset {
+        if let Ok(value) = HeaderValue::from_str(&offset.to_string()) {
+            response
+                .headers_mut()
+                .insert(HeaderName::from_static("upload-offset"), value);
+        }
+    }
+
+    if let Some(length) = length {
+        if let Ok(value) = HeaderValue::from_str(&length.to_string()) {
+            response
+                .headers_mut()
+                .insert(HeaderName::from_static("upload-length"), value);
+        }
+    }
+}
+
+fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
+}
+
+fn metadata_filename(headers: &HeaderMap) -> Option<String> {
+    let metadata = header(headers, "upload-metadata")?;
+
+    for item in metadata.split(',') {
+        let (key, value) = item.trim().split_once(' ')?;
+
+        if key == "filename" {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(value)
+                .ok()?;
+            let name = String::from_utf8(bytes).ok()?;
+            return Some(sanitize_filename(&name));
+        }
+    }
+
+    None
+}
+
+fn sanitize_filename(value: &str) -> String {
+    let name = Path::new(value)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("upload.bin");
+
+    let sanitized = name
+        .chars()
+        .map(|character| {
+            if character.is_control() || character == '/' || character == '\\' {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+
+    let trimmed = sanitized.trim().trim_matches('.').to_owned();
+
+    if trimmed.is_empty() {
+        "upload.bin".to_owned()
+    } else {
+        trimmed.chars().take(200).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_filename;
+
+    #[test]
+    fn sanitizes_upload_names() {
+        assert_eq!(sanitize_filename("../../etc/passwd"), "passwd");
+        assert_eq!(sanitize_filename("Artist/Album/Track.mp3"), "Track.mp3");
+        assert_eq!(sanitize_filename(""), "upload.bin");
+    }
+}
