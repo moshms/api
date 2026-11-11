@@ -378,8 +378,8 @@ async fn features(State(state): State<AppState>) -> Json<Features> {
     Json(Features {
         worker,
         transcoder,
-        tag_editor: false,
-        monitoring: false,
+        tag_editor: worker,
+        monitoring: state.metrics.is_some(),
     })
 }
 
