@@ -22,11 +22,12 @@ pub async fn list(
     headers: HeaderMap,
 ) -> Result<Json<FavoritesResponse>, ApiError> {
     let user = auth::authenticate(&state, &headers).await?;
+    let visible = user.visible_library_ids();
 
     Ok(Json(FavoritesResponse {
-        tracks: catalog::starred_tracks(&state.pool, user.id).await?,
-        albums: catalog::starred_albums(&state.pool, user.id).await?,
-        artists: catalog::starred_artists(&state.pool, user.id).await?,
+        tracks: catalog::starred_tracks(&state.pool, user.id, &visible).await?,
+        albums: catalog::starred_albums(&state.pool, user.id, &visible).await?,
+        artists: catalog::starred_artists(&state.pool, user.id, &visible).await?,
     }))
 }
 
@@ -85,11 +86,18 @@ async fn star(
     item_id: Uuid,
 ) -> Result<StatusCode, ApiError> {
     let user = auth::authenticate(state, headers).await?;
+    let visible = user.visible_library_ids();
 
     let exists = match item_type {
-        ItemType::Track => catalog::get_track(&state.pool, item_id).await?.is_some(),
-        ItemType::Album => catalog::get_album(&state.pool, item_id).await?.is_some(),
-        ItemType::Artist => catalog::get_artist(&state.pool, item_id).await?.is_some(),
+        ItemType::Track => catalog::get_track(&state.pool, item_id, &visible)
+            .await?
+            .is_some(),
+        ItemType::Album => catalog::get_album(&state.pool, item_id, &visible)
+            .await?
+            .is_some(),
+        ItemType::Artist => catalog::get_artist(&state.pool, item_id, &visible)
+            .await?
+            .is_some(),
     };
 
     if !exists {

@@ -1,16 +1,20 @@
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
+use mc_authz::Permissions;
 use mc_core::Role;
+use mc_db::repos::audit;
 use mc_db::repos::libraries::{self, LibraryRecord};
+use mc_db::repos::permissions;
+use mc_db::repos::roles;
 use mc_db::repos::storages::{self, StorageRecord};
 use mc_db::repos::users::{self, UserSummary};
 use mc_storage::Key;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::auth;
+use crate::auth::{self, RoleDto};
 use crate::error::ApiError;
 use crate::state::AppState;
 use mc_runtime::StorageRegistry;
@@ -48,6 +52,16 @@ pub struct CreateStorageRequest {
     pub config: Value,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct LibraryAccessRequest {
+    #[serde(default)]
+    pub everyone: bool,
+    #[serde(default)]
+    pub roles: Vec<Uuid>,
+    #[serde(default)]
+    pub users: Vec<Uuid>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CreateLibraryRequest {
     pub name: String,
@@ -56,13 +70,15 @@ pub struct CreateLibraryRequest {
     pub root_prefix: Option<String>,
     #[serde(default)]
     pub is_import_target: Option<bool>,
+    #[serde(default)]
+    pub access: Option<LibraryAccessRequest>,
 }
 
 pub async fn list_storages(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<StorageDto>>, ApiError> {
-    auth::require_admin(&state, &headers).await?;
+    auth::require_permission(&state, &headers, Permissions::MANAGE_STORAGES).await?;
     let records = storages::list(&state.pool).await?;
 
     Ok(Json(records.iter().map(StorageDto::from).collect()))
@@ -73,7 +89,7 @@ pub async fn create_storage(
     headers: HeaderMap,
     Json(request): Json<CreateStorageRequest>,
 ) -> Result<(StatusCode, Json<StorageDto>), ApiError> {
-    auth::require_admin(&state, &headers).await?;
+    auth::require_permission(&state, &headers, Permissions::MANAGE_STORAGES).await?;
 
     let name = request.name.trim();
     if name.is_empty() || name.chars().count() > 100 {
@@ -121,7 +137,7 @@ pub async fn delete_storage(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    auth::require_admin(&state, &headers).await?;
+    auth::require_permission(&state, &headers, Permissions::MANAGE_STORAGES).await?;
 
     if libraries::count_by_storage(&state.pool, id).await? > 0 {
         return Err(ApiError::new(
@@ -142,7 +158,7 @@ pub async fn list_libraries(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<LibraryRecord>>, ApiError> {
-    auth::require_admin(&state, &headers).await?;
+    auth::require_permission(&state, &headers, Permissions::MANAGE_LIBRARIES).await?;
     Ok(Json(libraries::list(&state.pool).await?))
 }
 
@@ -151,7 +167,7 @@ pub async fn create_library(
     headers: HeaderMap,
     Json(request): Json<CreateLibraryRequest>,
 ) -> Result<(StatusCode, Json<LibraryRecord>), ApiError> {
-    auth::require_admin(&state, &headers).await?;
+    let actor = auth::require_permission(&state, &headers, Permissions::MANAGE_LIBRARIES).await?;
 
     let name = request.name.trim();
     if name.is_empty() || name.chars().count() > 100 {
@@ -180,7 +196,19 @@ pub async fn create_library(
     )
     .await?;
 
+    apply_library_access(&state, library.id, request.access.as_ref()).await?;
     reload_registry(&state).await?;
+
+    audit::log(
+        &state.pool,
+        Some(actor.id),
+        "library.create",
+        "library",
+        Some(library.id),
+        json!({ "name": library.name, "access": request.access }),
+    )
+    .await?;
+
     Ok((StatusCode::CREATED, Json(library)))
 }
 
@@ -189,7 +217,7 @@ pub async fn delete_library(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    auth::require_admin(&state, &headers).await?;
+    auth::require_permission(&state, &headers, Permissions::MANAGE_LIBRARIES).await?;
 
     if !libraries::delete(&state.pool, id).await? {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "library not found"));
@@ -211,17 +239,7 @@ pub struct AdminUserDto {
     pub username: String,
     pub role: String,
     pub is_active: bool,
-}
-
-impl From<&UserSummary> for AdminUserDto {
-    fn from(user: &UserSummary) -> Self {
-        Self {
-            id: user.id,
-            username: user.username.clone(),
-            role: user.role.clone(),
-            is_active: user.is_active,
-        }
-    }
+    pub roles: Vec<RoleDto>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -245,10 +263,18 @@ pub async fn list_users(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<AdminUserDto>>, ApiError> {
-    auth::require_admin(&state, &headers).await?;
+    let actor = auth::authenticate(&state, &headers).await?;
+    if !actor.can(Permissions::MANAGE_USERS) && !actor.can(Permissions::MANAGE_ROLES) {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "permission denied"));
+    }
     let users = users::list(&state.pool).await?;
+    let mut result = Vec::with_capacity(users.len());
 
-    Ok(Json(users.iter().map(AdminUserDto::from).collect()))
+    for user in &users {
+        result.push(admin_user_dto(&state.pool, user).await?);
+    }
+
+    Ok(Json(result))
 }
 
 pub async fn create_user(
@@ -256,7 +282,7 @@ pub async fn create_user(
     headers: HeaderMap,
     Json(request): Json<CreateUserRequest>,
 ) -> Result<(StatusCode, Json<AdminUserDto>), ApiError> {
-    auth::require_admin(&state, &headers).await?;
+    let actor = auth::require_permission(&state, &headers, Permissions::MANAGE_USERS).await?;
 
     let username = request.username.trim();
     if username.is_empty() || username.chars().count() > 100 {
@@ -266,12 +292,7 @@ pub async fn create_user(
         ));
     }
 
-    if request.password.chars().count() < 8 {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "password must contain at least 8 characters",
-        ));
-    }
+    validate_password(&request.password)?;
 
     let role = parse_role(&request.role)?;
     let password_hash = mc_auth::hash_password(&request.password)?;
@@ -284,15 +305,28 @@ pub async fn create_user(
         role.as_str(),
     )
     .await?;
+    sync_legacy_role(&state.pool, user.id, role.as_str()).await?;
+
+    audit::log(
+        &state.pool,
+        Some(actor.id),
+        "user.create",
+        "user",
+        Some(user.id),
+        json!({ "username": user.username, "role": role.as_str() }),
+    )
+    .await?;
+
+    let summary = UserSummary {
+        id: user.id,
+        username: user.username,
+        role: user.role,
+        is_active: user.is_active,
+    };
 
     Ok((
         StatusCode::CREATED,
-        Json(AdminUserDto {
-            id: user.id,
-            username: user.username,
-            role: user.role,
-            is_active: user.is_active,
-        }),
+        Json(admin_user_dto(&state.pool, &summary).await?),
     ))
 }
 
@@ -302,7 +336,7 @@ pub async fn update_user(
     Path(id): Path<Uuid>,
     Json(request): Json<UpdateUserRequest>,
 ) -> Result<Json<AdminUserDto>, ApiError> {
-    auth::require_admin(&state, &headers).await?;
+    let actor = auth::require_permission(&state, &headers, Permissions::MANAGE_USERS).await?;
 
     let Some(current) = users::get(&state.pool, id).await? else {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "user not found"));
@@ -312,10 +346,10 @@ pub async fn update_user(
     let new_role = role.map_or_else(|| current.role.clone(), |role| role.as_str().to_owned());
     let new_active = request.is_active.unwrap_or(current.is_active);
 
-    if current.role == "admin"
-        && current.is_active
+    if current.is_active
         && (new_role.as_str() != "admin" || !new_active)
-        && users::count_active_admins(&state.pool).await? <= 1
+        && roles::has_admin_role(&state.pool, id).await?
+        && roles::count_active_admins(&state.pool).await? <= 1
     {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -325,6 +359,7 @@ pub async fn update_user(
 
     if role.is_some() {
         users::update_role(&state.pool, id, &new_role).await?;
+        sync_legacy_role(&state.pool, id, &new_role).await?;
     }
 
     if request.is_active.is_some() {
@@ -332,13 +367,7 @@ pub async fn update_user(
     }
 
     if let Some(password) = request.password.as_deref() {
-        if password.chars().count() < 8 {
-            return Err(ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "password must contain at least 8 characters",
-            ));
-        }
-
+        validate_password(password)?;
         let password_hash = mc_auth::hash_password(password)?;
         users::update_password(&state.pool, id, &password_hash).await?;
     }
@@ -347,12 +376,24 @@ pub async fn update_user(
         .await?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "user not found"))?;
 
-    Ok(Json(AdminUserDto {
+    audit::log(
+        &state.pool,
+        Some(actor.id),
+        "user.update",
+        "user",
+        Some(id),
+        json!({ "role": user.role, "is_active": user.is_active }),
+    )
+    .await?;
+
+    let summary = UserSummary {
         id: user.id,
         username: user.username,
         role: user.role,
         is_active: user.is_active,
-    }))
+    };
+
+    Ok(Json(admin_user_dto(&state.pool, &summary).await?))
 }
 
 pub async fn delete_user(
@@ -360,7 +401,7 @@ pub async fn delete_user(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    let current = auth::require_admin(&state, &headers).await?;
+    let current = auth::require_permission(&state, &headers, Permissions::MANAGE_USERS).await?;
 
     if current.id == id {
         return Err(ApiError::new(
@@ -373,7 +414,9 @@ pub async fn delete_user(
         return Err(ApiError::new(StatusCode::NOT_FOUND, "user not found"));
     };
 
-    if user.role == "admin" && user.is_active && users::count_active_admins(&state.pool).await? <= 1
+    if user.is_active
+        && roles::has_admin_role(&state.pool, id).await?
+        && roles::count_active_admins(&state.pool).await? <= 1
     {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -382,10 +425,158 @@ pub async fn delete_user(
     }
 
     if users::delete(&state.pool, id).await? {
+        audit::log(
+            &state.pool,
+            Some(current.id),
+            "user.delete",
+            "user",
+            Some(id),
+            json!({ "username": user.username }),
+        )
+        .await?;
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::new(StatusCode::NOT_FOUND, "user not found"))
     }
+}
+
+async fn admin_user_dto(
+    pool: &mc_db::PgPool,
+    user: &UserSummary,
+) -> Result<AdminUserDto, ApiError> {
+    let roles = roles::for_user(pool, user.id).await?;
+
+    Ok(AdminUserDto {
+        id: user.id,
+        username: user.username.clone(),
+        role: user.role.clone(),
+        is_active: user.is_active,
+        roles: roles.iter().map(RoleDto::from).collect(),
+    })
+}
+
+fn validate_password(password: &str) -> Result<(), ApiError> {
+    if password.chars().count() < 12 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "password must contain at least 12 characters",
+        ));
+    }
+
+    if password.eq_ignore_ascii_case("change-me") {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "default password is not allowed",
+        ));
+    }
+
+    Ok(())
+}
+
+async fn sync_legacy_role(pool: &mc_db::PgPool, user_id: Uuid, role: &str) -> Result<(), ApiError> {
+    let all_roles = roles::list(pool).await?;
+    let admin_role = all_roles
+        .iter()
+        .find(|role| !role.is_everyone && role.permissions & 1 != 0);
+    let uploader_role = all_roles
+        .iter()
+        .find(|role| !role.is_everyone && role.name.eq_ignore_ascii_case("Загрузчик"));
+
+    match role {
+        "admin" => {
+            if let Some(role) = admin_role {
+                roles::assign(pool, user_id, role.id).await?;
+            }
+            if let Some(role) = uploader_role {
+                let _ = roles::unassign(pool, user_id, role.id).await?;
+            }
+        }
+        "uploader" => {
+            if let Some(role) = uploader_role {
+                roles::assign(pool, user_id, role.id).await?;
+            }
+            if let Some(role) = admin_role {
+                let _ = roles::unassign(pool, user_id, role.id).await?;
+            }
+        }
+        _ => {
+            if let Some(role) = admin_role {
+                let _ = roles::unassign(pool, user_id, role.id).await?;
+            }
+            if let Some(role) = uploader_role {
+                let _ = roles::unassign(pool, user_id, role.id).await?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn apply_library_access(
+    state: &AppState,
+    library_id: Uuid,
+    access: Option<&LibraryAccessRequest>,
+) -> Result<(), ApiError> {
+    let Some(access) = access else {
+        return Ok(());
+    };
+
+    let allow = i64::try_from(
+        Permissions::LIBRARY_VIEW
+            .union(Permissions::LIBRARY_DOWNLOAD)
+            .bits(),
+    )
+    .unwrap_or(i64::MAX);
+
+    if access.everyone {
+        let everyone = roles::everyone(&state.pool)
+            .await?
+            .ok_or_else(|| ApiError::internal("everyone role is missing"))?;
+        permissions::upsert(
+            &state.pool,
+            "library",
+            library_id,
+            "role",
+            everyone.id,
+            allow,
+            0,
+        )
+        .await?;
+    }
+
+    for role_id in &access.roles {
+        if roles::get(&state.pool, *role_id).await?.is_none() {
+            return Err(ApiError::new(StatusCode::NOT_FOUND, "role not found"));
+        }
+        permissions::upsert(
+            &state.pool,
+            "library",
+            library_id,
+            "role",
+            *role_id,
+            allow,
+            0,
+        )
+        .await?;
+    }
+
+    for user_id in &access.users {
+        if users::get(&state.pool, *user_id).await?.is_none() {
+            return Err(ApiError::new(StatusCode::NOT_FOUND, "user not found"));
+        }
+        permissions::upsert(
+            &state.pool,
+            "library",
+            library_id,
+            "user",
+            *user_id,
+            allow,
+            0,
+        )
+        .await?;
+    }
+
+    Ok(())
 }
 
 fn parse_role(value: &str) -> Result<Role, ApiError> {
@@ -401,7 +592,7 @@ pub async fn list_jobs(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<mc_jobs::JobRecord>>, ApiError> {
-    auth::require_admin(&state, &headers).await?;
+    auth::require_permission(&state, &headers, Permissions::RUN_SCANS).await?;
     Ok(Json(mc_jobs::list(&state.pool, 100).await?))
 }
 
@@ -410,7 +601,7 @@ pub async fn retry_job(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    auth::require_admin(&state, &headers).await?;
+    auth::require_permission(&state, &headers, Permissions::RUN_SCANS).await?;
 
     if mc_jobs::retry(&state.pool, id).await? {
         Ok(StatusCode::NO_CONTENT)

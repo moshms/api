@@ -16,6 +16,10 @@ impl ApiError {
             message: message.into(),
         }
     }
+
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, message)
+    }
 }
 
 impl From<CoreError> for ApiError {

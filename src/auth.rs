@@ -3,12 +3,15 @@ use axum::http::header::{AUTHORIZATION, COOKIE, SET_COOKIE, USER_AGENT};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use mc_authz::Permissions;
 use mc_core::Role;
+use mc_db::repos::roles::{self, RoleRecord};
 use mc_db::repos::{api_tokens, sessions, users};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::authz::{self, AuthzContext};
 use crate::config::Config;
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -19,6 +22,61 @@ pub struct AuthUser {
     pub username: String,
     pub role: Role,
     pub subsonic_secret: String,
+    pub authz: AuthzContext,
+}
+
+impl AuthUser {
+    #[must_use]
+    pub fn is_admin(&self) -> bool {
+        self.authz.is_admin()
+    }
+
+    #[must_use]
+    pub fn can(&self, permission: Permissions) -> bool {
+        self.authz.can(permission)
+    }
+
+    #[must_use]
+    pub fn can_library(&self, library_id: Uuid, permission: Permissions) -> bool {
+        self.authz.can_library(library_id, permission)
+    }
+
+    #[must_use]
+    pub fn visible_library_ids(&self) -> Vec<Uuid> {
+        self.authz.visible_library_ids()
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RoleDto {
+    pub id: Uuid,
+    pub name: String,
+    pub color: Option<i32>,
+    pub position: i32,
+    pub permissions: u64,
+    pub is_everyone: bool,
+    pub member_count: i64,
+}
+
+impl From<&RoleRecord> for RoleDto {
+    fn from(role: &RoleRecord) -> Self {
+        Self {
+            id: role.id,
+            name: role.name.clone(),
+            color: role.color,
+            position: role.position,
+            permissions: u64::try_from(role.permissions.max(0)).unwrap_or(0),
+            is_everyone: role.is_everyone,
+            member_count: role.member_count,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LibraryPermissionDto {
+    pub id: Uuid,
+    pub name: String,
+    pub permissions: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -26,6 +84,9 @@ pub struct UserDto {
     pub id: Uuid,
     pub username: String,
     pub role: Role,
+    pub roles: Vec<RoleDto>,
+    pub permissions: u64,
+    pub libraries: Vec<LibraryPermissionDto>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,9 +141,13 @@ pub async fn ensure_admin(pool: &mc_db::PgPool, config: &Config) -> anyhow::Resu
         return Ok(());
     }
 
+    if password.chars().count() < 12 || password.eq_ignore_ascii_case("change-me") {
+        anyhow::bail!("MC_ADMIN_PASSWORD must be at least 12 characters and not change-me");
+    }
+
     let password_hash = mc_auth::hash_password(password)?;
     let subsonic_secret = mc_auth::generate_secret();
-    users::create(
+    let user = users::create(
         pool,
         username,
         &password_hash,
@@ -90,6 +155,7 @@ pub async fn ensure_admin(pool: &mc_db::PgPool, config: &Config) -> anyhow::Resu
         Role::Admin.as_str(),
     )
     .await?;
+    assign_admin_role(pool, user.id).await?;
 
     info!(%username, "created initial administrator");
     Ok(())
@@ -121,12 +187,7 @@ pub async fn setup(
         ));
     }
 
-    if request.password.chars().count() < 8 {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "password must contain at least 8 characters",
-        ));
-    }
+    validate_password(&request.password)?;
 
     let password_hash = mc_auth::hash_password(&request.password)?;
     let subsonic_secret = mc_auth::generate_secret();
@@ -138,6 +199,9 @@ pub async fn setup(
         Role::Admin.as_str(),
     )
     .await?;
+    assign_admin_role(&state.pool, user.id)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
 
     info!(%username, "created initial administrator via setup");
     issue_session(&state, &headers, &user).await
@@ -184,11 +248,8 @@ async fn issue_session(
     )
     .await?;
 
-    let body = UserDto {
-        id: user.id,
-        username: user.username.clone(),
-        role: role_from_str(&user.role)?,
-    };
+    let authz = authz::load(&state.pool, user.id).await?;
+    let body = user_dto(user, &authz);
     let mut response = Json(body).into_response();
     response.headers_mut().insert(
         SET_COOKIE,
@@ -232,6 +293,21 @@ pub async fn me(
         id: user.id,
         username: user.username,
         role: user.role,
+        roles: user.authz.roles.iter().map(RoleDto::from).collect(),
+        permissions: user.authz.server.bits(),
+        libraries: user
+            .authz
+            .libraries
+            .iter()
+            .filter(|library| {
+                user.authz.is_admin() || library.permissions.intersects(Permissions::LIBRARY_BITS)
+            })
+            .map(|library| LibraryPermissionDto {
+                id: library.id,
+                name: library.name.clone(),
+                permissions: library.permissions.bits(),
+            })
+            .collect(),
     }))
 }
 
@@ -321,11 +397,13 @@ pub async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<AuthU
         if let Some(user) = api_tokens::find_user(&state.pool, &token_hash).await? {
             let _ = api_tokens::touch(&state.pool, &token_hash).await;
             return auth_user(
+                &state.pool,
                 user.user_id,
                 user.username,
                 &user.role,
                 user.subsonic_secret,
-            );
+            )
+            .await;
         }
 
         return Err(authentication_required());
@@ -342,38 +420,100 @@ pub async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<AuthU
 
     let _ = sessions::touch(&state.pool, &token_hash).await;
     auth_user(
+        &state.pool,
         user.user_id,
         user.username,
         &user.role,
         user.subsonic_secret,
     )
+    .await
 }
 
-pub async fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<AuthUser, ApiError> {
+pub async fn require_permission(
+    state: &AppState,
+    headers: &HeaderMap,
+    permission: Permissions,
+) -> Result<AuthUser, ApiError> {
     let user = authenticate(state, headers).await?;
 
-    if user.role.is_admin() {
+    if user.can(permission) {
         Ok(user)
     } else {
-        Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            "administrator role required",
-        ))
+        Err(ApiError::new(StatusCode::FORBIDDEN, "permission denied"))
     }
 }
 
-fn auth_user(
+async fn auth_user(
+    pool: &mc_db::PgPool,
     id: Uuid,
     username: String,
     role: &str,
     subsonic_secret: String,
 ) -> Result<AuthUser, ApiError> {
+    let authz = authz::load(pool, id).await?;
+
     Ok(AuthUser {
         id,
         username,
         role: role_from_str(role)?,
         subsonic_secret,
+        authz,
     })
+}
+
+fn user_dto(user: &users::UserRecord, authz: &AuthzContext) -> UserDto {
+    UserDto {
+        id: user.id,
+        username: user.username.clone(),
+        role: role_from_str(&user.role).unwrap_or(Role::Listener),
+        roles: authz.roles.iter().map(RoleDto::from).collect(),
+        permissions: authz.server.bits(),
+        libraries: authz
+            .libraries
+            .iter()
+            .filter(|library| {
+                authz.is_admin() || library.permissions.intersects(Permissions::LIBRARY_BITS)
+            })
+            .map(|library| LibraryPermissionDto {
+                id: library.id,
+                name: library.name.clone(),
+                permissions: library.permissions.bits(),
+            })
+            .collect(),
+    }
+}
+
+async fn assign_admin_role(pool: &mc_db::PgPool, user_id: Uuid) -> anyhow::Result<()> {
+    let roles = roles::list(pool).await?;
+    let admin = roles
+        .iter()
+        .find(|role| !role.is_everyone && role.permissions & 1 != 0);
+
+    if let Some(admin) = admin {
+        roles::assign(pool, user_id, admin.id).await?;
+    } else {
+        warn!("administrator role is missing; user has no administrator permissions");
+    }
+
+    Ok(())
+}
+
+fn validate_password(password: &str) -> Result<(), ApiError> {
+    if password.chars().count() < 12 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "password must contain at least 12 characters",
+        ));
+    }
+
+    if password.eq_ignore_ascii_case("change-me") {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "default password is not allowed",
+        ));
+    }
+
+    Ok(())
 }
 
 fn role_from_str(value: &str) -> Result<Role, ApiError> {

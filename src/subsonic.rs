@@ -7,6 +7,7 @@ use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::Json;
+use mc_authz::Permissions;
 use mc_core::{CoreError, Role};
 use mc_db::repos::annotations::{self, ItemType};
 use mc_db::repos::catalog::{self, AlbumSummary, ArtistSummary, TrackDetail, TrackSummary};
@@ -20,6 +21,7 @@ use tokio_stream::StreamExt;
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
+use crate::authz;
 use crate::catalog::download_filename;
 use crate::state::AppState;
 
@@ -118,6 +120,10 @@ impl SubsonicError {
 
     fn not_found(entity: &str) -> Self {
         Self::new(70, format!("{entity} not found"))
+    }
+
+    fn forbidden() -> Self {
+        Self::new(50, "Not authorized")
     }
 
     fn internal() -> Self {
@@ -286,11 +292,13 @@ async fn get_music_folders_inner(
     state: &AppState,
     params: &SubsonicParams,
 ) -> Result<Value, SubsonicError> {
-    authenticate(state, params).await?;
+    let user = authenticate(state, params).await?;
+    let visible = user.visible_library_ids();
     let registry = state.registry.read().await;
     let folders = registry
         .libraries()
         .iter()
+        .filter(|library| visible.contains(&library.id))
         .map(|library| {
             json!({
                 "id": library.id.to_string(),
@@ -306,8 +314,9 @@ async fn get_indexes_inner(
     state: &AppState,
     params: &SubsonicParams,
 ) -> Result<Value, SubsonicError> {
-    authenticate(state, params).await?;
-    let artists = catalog::list_artists(&state.pool).await?;
+    let user = authenticate(state, params).await?;
+    let visible = user.visible_library_ids();
+    let artists = catalog::list_artists(&state.pool, &visible).await?;
 
     Ok(json!({
         "indexes": {
@@ -322,8 +331,9 @@ async fn get_artists_inner(
     state: &AppState,
     params: &SubsonicParams,
 ) -> Result<Value, SubsonicError> {
-    authenticate(state, params).await?;
-    let artists = catalog::list_artists(&state.pool).await?;
+    let user = authenticate(state, params).await?;
+    let visible = user.visible_library_ids();
+    let artists = catalog::list_artists(&state.pool, &visible).await?;
 
     Ok(json!({
         "artists": {
@@ -337,9 +347,10 @@ async fn get_artist_inner(
     state: &AppState,
     params: &SubsonicParams,
 ) -> Result<Value, SubsonicError> {
-    authenticate(state, params).await?;
+    let user = authenticate(state, params).await?;
+    let visible = user.visible_library_ids();
     let id = required_uuid(params, "id")?;
-    let artist = catalog::get_artist(&state.pool, id)
+    let artist = catalog::get_artist(&state.pool, id, &visible)
         .await?
         .ok_or_else(|| SubsonicError::not_found("Artist"))?;
     let albums = artist.albums.iter().map(album_json).collect::<Vec<_>>();
@@ -358,9 +369,10 @@ async fn get_album_inner(
     state: &AppState,
     params: &SubsonicParams,
 ) -> Result<Value, SubsonicError> {
-    authenticate(state, params).await?;
+    let user = authenticate(state, params).await?;
+    let visible = user.visible_library_ids();
     let id = required_uuid(params, "id")?;
-    let detail = catalog::get_album(&state.pool, id)
+    let detail = catalog::get_album(&state.pool, id, &visible)
         .await?
         .ok_or_else(|| SubsonicError::not_found("Album"))?;
     let mut album = album_json(&detail.album);
@@ -379,11 +391,12 @@ async fn get_album_list2_inner(
     state: &AppState,
     params: &SubsonicParams,
 ) -> Result<Value, SubsonicError> {
-    authenticate(state, params).await?;
+    let user = authenticate(state, params).await?;
+    let visible = user.visible_library_ids();
     let kind = params.get("type").unwrap_or("alphabeticalByName");
     let offset = param_usize(params, "offset", 0);
     let size = param_usize(params, "size", 10).clamp(1, 500);
-    let mut albums = catalog::list_albums(&state.pool, None).await?;
+    let mut albums = catalog::list_albums(&state.pool, None, &visible).await?;
 
     match kind {
         "newest" | "recent" => albums.sort_by(|left, right| {
@@ -414,9 +427,10 @@ async fn get_album_list2_inner(
 }
 
 async fn get_song_inner(state: &AppState, params: &SubsonicParams) -> Result<Value, SubsonicError> {
-    authenticate(state, params).await?;
+    let user = authenticate(state, params).await?;
+    let visible = user.visible_library_ids();
     let id = required_uuid(params, "id")?;
-    let track = catalog::get_track(&state.pool, id)
+    let track = catalog::get_track(&state.pool, id, &visible)
         .await?
         .ok_or_else(|| SubsonicError::not_found("Song"))?;
 
@@ -424,7 +438,8 @@ async fn get_song_inner(state: &AppState, params: &SubsonicParams) -> Result<Val
 }
 
 async fn search3_inner(state: &AppState, params: &SubsonicParams) -> Result<Value, SubsonicError> {
-    authenticate(state, params).await?;
+    let user = authenticate(state, params).await?;
+    let visible = user.visible_library_ids();
     let query = params.required("query")?.trim();
     let artist_count = param_usize(params, "artistCount", 20).min(500);
     let album_count = param_usize(params, "albumCount", 20).min(500);
@@ -441,7 +456,7 @@ async fn search3_inner(state: &AppState, params: &SubsonicParams) -> Result<Valu
     }
 
     let limit = artist_count.max(album_count).max(song_count).max(1) as i64;
-    let results = catalog::search(&state.pool, query, limit).await?;
+    let results = catalog::search(&state.pool, query, limit, &visible).await?;
     let artists = results
         .artists
         .iter()
@@ -475,11 +490,20 @@ async fn stream_inner(
     params: &SubsonicParams,
     download: bool,
 ) -> Result<Response, SubsonicError> {
-    authenticate(state, params).await?;
+    let user = authenticate(state, params).await?;
+    let visible = user.visible_library_ids();
     let id = required_uuid(params, "id")?;
-    let track = catalog::get_track(&state.pool, id)
+    let track = catalog::get_track(&state.pool, id, &visible)
         .await?
         .ok_or_else(|| SubsonicError::not_found("Song"))?;
+    let permission = if download {
+        Permissions::LIBRARY_DOWNLOAD
+    } else {
+        Permissions::LIBRARY_VIEW
+    };
+    if !user.can_library(track.library_id, permission) {
+        return Err(SubsonicError::not_found("Song"));
+    }
     let storage = state
         .registry
         .read()
@@ -498,7 +522,7 @@ async fn stream_inner(
                 .is_none_or(|bitrate| bitrate > i32::try_from(maximum).unwrap_or(i32::MAX))
         });
 
-    if needs_transcode && storage.caps().local_path {
+    if needs_transcode && storage.caps().local_path && user.can(Permissions::TRANSCODE) {
         if let Some(transcoder) = &state.transcoder {
             let format = requested_format.unwrap_or("mp3");
             let bitrate = max_bitrate.unwrap_or(128).clamp(32, 320);
@@ -558,14 +582,17 @@ async fn get_cover_art_inner(
     state: &AppState,
     params: &SubsonicParams,
 ) -> Result<Response, SubsonicError> {
-    authenticate(state, params).await?;
+    let user = authenticate(state, params).await?;
+    let visible = user.visible_library_ids();
     let id = required_uuid(params, "id")?;
 
-    let artwork = match catalog::get_album_artwork(&state.pool, id).await? {
+    let artwork = match catalog::get_album_artwork(&state.pool, id, &visible).await? {
         Some(artwork) => Some(artwork),
-        None => match catalog::get_track(&state.pool, id).await? {
+        None => match catalog::get_track(&state.pool, id, &visible).await? {
             Some(track) => match track.album_id {
-                Some(album_id) => catalog::get_album_artwork(&state.pool, album_id).await?,
+                Some(album_id) => {
+                    catalog::get_album_artwork(&state.pool, album_id, &visible).await?
+                }
                 None => None,
             },
             None => None,
@@ -622,6 +649,22 @@ async fn apply_star(
     item_id: Uuid,
     star: bool,
 ) -> Result<(), SubsonicError> {
+    let visible = user.visible_library_ids();
+    let exists = match item_type {
+        ItemType::Track => catalog::get_track(&state.pool, item_id, &visible)
+            .await?
+            .is_some(),
+        ItemType::Album => catalog::get_album(&state.pool, item_id, &visible)
+            .await?
+            .is_some(),
+        ItemType::Artist => catalog::get_artist(&state.pool, item_id, &visible)
+            .await?
+            .is_some(),
+    };
+    if !exists {
+        return Err(SubsonicError::not_found("Item"));
+    }
+
     if star {
         annotations::star(&state.pool, user.id, item_type, item_id).await?;
     } else {
@@ -639,10 +682,16 @@ async fn scrobble_inner(state: &AppState, params: &SubsonicParams) -> Result<Val
         .unwrap_or(true);
     let mut any = false;
 
+    let visible = user.visible_library_ids();
     for value in params.get_all("id") {
         let id = parse_uuid(value, "id")?;
-        annotations::scrobble(&state.pool, user.id, id, submission).await?;
-        any = true;
+        if catalog::get_track(&state.pool, id, &visible)
+            .await?
+            .is_some()
+        {
+            annotations::scrobble(&state.pool, user.id, id, submission).await?;
+            any = true;
+        }
     }
 
     if !any {
@@ -657,8 +706,19 @@ async fn get_playlists_inner(
     params: &SubsonicParams,
 ) -> Result<Value, SubsonicError> {
     let user = authenticate(state, params).await?;
-    let playlists = playlists::list(&state.pool, user.id).await?;
-    let playlists = playlists.iter().map(playlist_json).collect::<Vec<_>>();
+    let visible = user.visible_library_ids();
+    let all = playlists::list_with_counts(&state.pool, &visible).await?;
+    let overwrites = authz::playlist_overwrites(&state.pool, &user.authz)
+        .await
+        .map_err(|_| SubsonicError::internal())?;
+    let playlists = all
+        .iter()
+        .filter(|playlist| {
+            let records = overwrites.get(&playlist.id).map_or(&[][..], Vec::as_slice);
+            authz::resolve_playlist(&user.authz, playlist, records).can_view_playlist()
+        })
+        .map(playlist_json)
+        .collect::<Vec<_>>();
 
     Ok(json!({ "playlists": { "playlist": playlists } }))
 }
@@ -668,10 +728,17 @@ async fn get_playlist_inner(
     params: &SubsonicParams,
 ) -> Result<Value, SubsonicError> {
     let user = authenticate(state, params).await?;
+    let visible = user.visible_library_ids();
     let id = required_uuid(params, "id")?;
-    let detail = playlists::get(&state.pool, user.id, id)
+    let detail = playlists::get(&state.pool, id, &visible)
         .await?
         .ok_or_else(|| SubsonicError::not_found("Playlist"))?;
+    if !playlist_permissions(state, &user, &detail.playlist)
+        .await?
+        .can_view_playlist()
+    {
+        return Err(SubsonicError::not_found("Playlist"));
+    }
     let mut playlist = playlist_json(&detail.playlist);
 
     if let Value::Object(map) = &mut playlist {
@@ -693,26 +760,31 @@ async fn create_playlist_inner(
         .get("name")
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let song_ids = collect_ids(params, &["songId", "id"])?;
+    let song_ids =
+        filter_visible_track_ids(state, &user, &collect_ids(params, &["songId", "id"])?).await?;
 
     if let Some(value) = params.get("playlistId") {
         let playlist_id = parse_uuid(value, "playlistId")?;
-        let updated = playlists::update(
-            &state.pool,
-            user.id,
-            playlist_id,
-            name,
-            None,
-            &song_ids,
-            &[],
-        )
-        .await?;
+        let playlist = load_playlist_record(state, &user, playlist_id).await?;
+        if !playlist_permissions(state, &user, &playlist)
+            .await?
+            .contains(Permissions::PLAYLIST_EDIT)
+        {
+            return Err(SubsonicError::forbidden());
+        }
+
+        let updated =
+            playlists::update(&state.pool, playlist_id, name, None, &song_ids, &[]).await?;
 
         if !updated {
             return Err(SubsonicError::not_found("Playlist"));
         }
 
         return Ok(json!({ "playlist": { "id": playlist_id.to_string() } }));
+    }
+
+    if !user.can(Permissions::PLAYLIST_CREATE) {
+        return Err(SubsonicError::forbidden());
     }
 
     let name = name.ok_or_else(|| SubsonicError::missing("name"))?;
@@ -727,27 +799,56 @@ async fn update_playlist_inner(
 ) -> Result<Value, SubsonicError> {
     let user = authenticate(state, params).await?;
     let playlist_id = required_uuid(params, "playlistId")?;
+    let playlist = load_playlist_record(state, &user, playlist_id).await?;
+    let permissions = playlist_permissions(state, &user, &playlist).await?;
     let name = params
         .get("name")
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let is_public = params.get("public").map(|value| value == "true");
-    let add = collect_ids(params, &["songIdToAdd"])?;
+    let add =
+        filter_visible_track_ids(state, &user, &collect_ids(params, &["songIdToAdd"])?).await?;
     let remove = params
         .get_all("songIndexToRemove")
         .filter_map(|value| value.parse::<usize>().ok())
         .collect::<Vec<_>>();
 
-    let updated = playlists::update(
-        &state.pool,
-        user.id,
-        playlist_id,
-        name,
-        is_public,
-        &add,
-        &remove,
-    )
-    .await?;
+    if (name.is_some() || is_public.is_some())
+        && !permissions.contains(Permissions::PLAYLIST_MANAGE)
+    {
+        return Err(SubsonicError::forbidden());
+    }
+    if (!add.is_empty() || !remove.is_empty()) && !permissions.contains(Permissions::PLAYLIST_EDIT)
+    {
+        return Err(SubsonicError::forbidden());
+    }
+
+    if let Some(is_public) = is_public {
+        if is_public {
+            mc_db::repos::permissions::upsert(
+                &state.pool,
+                "playlist",
+                playlist_id,
+                "role",
+                user.authz.everyone_role_id,
+                i64::try_from(Permissions::PLAYLIST_VIEW.bits()).unwrap_or(i64::MAX),
+                0,
+            )
+            .await?;
+        } else {
+            mc_db::repos::permissions::delete(
+                &state.pool,
+                "playlist",
+                playlist_id,
+                "role",
+                user.authz.everyone_role_id,
+            )
+            .await?;
+        }
+    }
+
+    let updated =
+        playlists::update(&state.pool, playlist_id, name, is_public, &add, &remove).await?;
 
     if !updated {
         return Err(SubsonicError::not_found("Playlist"));
@@ -762,8 +863,15 @@ async fn delete_playlist_inner(
 ) -> Result<Value, SubsonicError> {
     let user = authenticate(state, params).await?;
     let playlist_id = required_uuid(params, "id")?;
+    let playlist = load_playlist_record(state, &user, playlist_id).await?;
+    if !playlist_permissions(state, &user, &playlist)
+        .await?
+        .contains(Permissions::PLAYLIST_MANAGE)
+    {
+        return Err(SubsonicError::forbidden());
+    }
 
-    if playlists::delete(&state.pool, user.id, playlist_id).await? {
+    if playlists::delete(&state.pool, playlist_id).await? {
         Ok(json!({}))
     } else {
         Err(SubsonicError::not_found("Playlist"))
@@ -786,7 +894,8 @@ async fn get_play_queue_inner(
         }));
     };
 
-    let tracks = catalog::get_tracks_by_ids(&state.pool, &queue.track_ids).await?;
+    let visible = user.visible_library_ids();
+    let tracks = catalog::get_tracks_by_ids(&state.pool, &queue.track_ids, &visible).await?;
     let current = queue
         .track_ids
         .get(usize::try_from(queue.current_index.max(0)).unwrap_or(0))
@@ -808,7 +917,7 @@ async fn save_play_queue_inner(
     params: &SubsonicParams,
 ) -> Result<Value, SubsonicError> {
     let user = authenticate(state, params).await?;
-    let ids = collect_ids(params, &["id"])?;
+    let ids = filter_visible_track_ids(state, &user, &collect_ids(params, &["id"])?).await?;
 
     if ids.is_empty() {
         return Err(SubsonicError::missing("id"));
@@ -834,6 +943,43 @@ async fn save_play_queue_inner(
     .await?;
 
     Ok(json!({}))
+}
+
+async fn filter_visible_track_ids(
+    state: &AppState,
+    user: &AuthUser,
+    ids: &[Uuid],
+) -> Result<Vec<Uuid>, SubsonicError> {
+    let visible = user.visible_library_ids();
+    Ok(catalog::get_tracks_by_ids(&state.pool, ids, &visible)
+        .await?
+        .into_iter()
+        .map(|track| track.id)
+        .collect())
+}
+
+async fn load_playlist_record(
+    state: &AppState,
+    user: &AuthUser,
+    id: Uuid,
+) -> Result<PlaylistRecord, SubsonicError> {
+    let visible = user.visible_library_ids();
+    playlists::get(&state.pool, id, &visible)
+        .await?
+        .map(|detail| detail.playlist)
+        .ok_or_else(|| SubsonicError::not_found("Playlist"))
+}
+
+async fn playlist_permissions(
+    state: &AppState,
+    user: &AuthUser,
+    playlist: &PlaylistRecord,
+) -> Result<Permissions, SubsonicError> {
+    let overwrites = authz::playlist_overwrites(&state.pool, &user.authz)
+        .await
+        .map_err(|_| SubsonicError::internal())?;
+    let records = overwrites.get(&playlist.id).map_or(&[][..], Vec::as_slice);
+    Ok(authz::resolve_playlist(&user.authz, playlist, records))
 }
 
 async fn authenticate(
@@ -863,12 +1009,16 @@ async fn authenticate(
         .role
         .parse::<Role>()
         .map_err(|_| SubsonicError::internal())?;
+    let authz = authz::load(&state.pool, user.id)
+        .await
+        .map_err(|_| SubsonicError::internal())?;
 
     Ok(AuthUser {
         id: user.id,
         username: user.username,
         role,
         subsonic_secret: user.subsonic_secret,
+        authz,
     })
 }
 
