@@ -1,11 +1,14 @@
 mod admin;
 mod auth;
+mod authz;
 mod catalog;
 mod config;
 mod error;
 mod favorites;
+mod permissions;
 mod playlists;
 mod probe;
+mod roles;
 mod state;
 mod subsonic;
 mod tag_edits;
@@ -15,7 +18,7 @@ mod uploads;
 use std::sync::Arc;
 
 use anyhow::Context;
-use axum::extract::{Request, State};
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::header::CACHE_CONTROL;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
@@ -24,8 +27,9 @@ use axum::routing::{delete, get, head, options, patch, post, put};
 use axum::{Json, Router};
 use config::Config;
 use error::ApiError;
+use mc_authz::Permissions;
 use mc_crypto::MasterKey;
-use mc_db::repos::libraries;
+use mc_db::repos::{libraries, permissions as db_permissions, roles as db_roles};
 use mc_db::PgPool;
 use mc_media::LoftyParser;
 use mc_runtime::StorageRegistry;
@@ -95,9 +99,29 @@ async fn main() -> anyhow::Result<()> {
         .context("parse MC_MASTER_KEY")?;
 
     if libraries::list(&pool).await?.is_empty() {
-        libraries::ensure_default(&pool, &config.library_name, &config.library_path)
+        let library = libraries::ensure_default(&pool, &config.library_name, &config.library_path)
             .await
             .context("ensure default library")?;
+
+        if config.library_access == "everyone" {
+            if let Some(everyone) = db_roles::everyone(&pool).await? {
+                db_permissions::upsert(
+                    &pool,
+                    "library",
+                    library.id,
+                    "role",
+                    everyone.id,
+                    i64::try_from(
+                        Permissions::LIBRARY_VIEW
+                            .union(Permissions::LIBRARY_DOWNLOAD)
+                            .bits(),
+                    )
+                    .unwrap_or(i64::MAX),
+                    0,
+                )
+                .await?;
+            }
+        }
     }
 
     tokio::fs::create_dir_all(&config.staging_path)
@@ -279,10 +303,46 @@ fn api_router(state: AppState) -> Router {
         .route("/api/v1/admin/jobs", get(admin::list_jobs))
         .route("/api/v1/admin/jobs/{id}/retry", post(admin::retry_job))
         .route(
+            "/api/v1/tag-edits",
+            get(tag_edits::list).post(tag_edits::create),
+        )
+        .route("/api/v1/tag-edits/{id}", get(tag_edits::get))
+        .layer(DefaultBodyLimit::max(15 * 1024 * 1024))
+        .route(
             "/api/v1/admin/tag-edits",
             get(tag_edits::list).post(tag_edits::create),
         )
         .route("/api/v1/admin/tag-edits/{id}", get(tag_edits::get))
+        .route("/api/v1/roles", get(roles::list).post(roles::create))
+        .route("/api/v1/roles/available", get(roles::available_roles))
+        .route("/api/v1/roles/order", put(roles::reorder))
+        .route(
+            "/api/v1/roles/{id}",
+            patch(roles::update).delete(roles::delete),
+        )
+        .route("/api/v1/users/available", get(roles::available_users))
+        .route(
+            "/api/v1/users/{id}/roles/{role_id}",
+            put(roles::assign).delete(roles::unassign),
+        )
+        .route("/api/v1/permissions", get(roles::permission_catalog))
+        .route("/api/v1/audit-log", get(roles::audit_log))
+        .route(
+            "/api/v1/libraries/{id}/permissions",
+            get(permissions::library_list),
+        )
+        .route(
+            "/api/v1/libraries/{id}/permissions/{target_type}/{target_id}",
+            put(permissions::library_set).delete(permissions::library_delete),
+        )
+        .route(
+            "/api/v1/playlists/{id}/permissions",
+            get(permissions::playlist_list),
+        )
+        .route(
+            "/api/v1/playlists/{id}/permissions/{target_type}/{target_id}",
+            put(permissions::playlist_set).delete(permissions::playlist_delete),
+        )
         .route("/rest/ping", get(subsonic::ping))
         .route("/rest/ping.view", get(subsonic::ping))
         .route("/rest/getLicense", get(subsonic::get_license))
@@ -366,7 +426,11 @@ async fn metrics(State(state): State<AppState>) -> Response {
     }
 }
 
-async fn features(State(state): State<AppState>) -> Json<Features> {
+async fn features(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Features>, ApiError> {
+    auth::authenticate(&state, &headers).await?;
     let transcoder = match &state.transcoder {
         Some(client) => client.is_available().await,
         None => false,
@@ -375,16 +439,18 @@ async fn features(State(state): State<AppState>) -> Json<Features> {
         .await
         .unwrap_or(false);
 
-    Json(Features {
+    Ok(Json(Features {
         worker,
         transcoder,
         tag_editor: worker,
         monitoring: state.metrics.is_some(),
-    })
+    }))
 }
 
 async fn scan(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(api_error) = auth::require_admin(&state, &headers).await {
+    if let Err(api_error) =
+        auth::require_permission(&state, &headers, mc_authz::Permissions::RUN_SCANS).await
+    {
         return api_error.into_response();
     }
 

@@ -2,6 +2,8 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use base64::Engine;
+use mc_authz::Permissions;
+use mc_db::repos::catalog;
 use mc_db::repos::tag_edits::{self, TagEditRecord};
 use mc_media::TagChanges;
 use serde::Deserialize;
@@ -26,7 +28,7 @@ pub async fn create(
     headers: HeaderMap,
     Json(request): Json<CreateTagEditRequest>,
 ) -> Result<(StatusCode, Json<TagEditRecord>), ApiError> {
-    let user = auth::require_admin(&state, &headers).await?;
+    let user = auth::authenticate(&state, &headers).await?;
 
     if !mc_jobs::is_worker_online(&state.pool, 30).await? {
         return Err(ApiError::new(
@@ -83,6 +85,20 @@ pub async fn create(
         ));
     }
 
+    let visible = user.visible_library_ids();
+    for track_id in &request.track_ids {
+        let track = catalog::get_track(&state.pool, *track_id, &visible)
+            .await?
+            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "track not found"))?;
+        let can_edit = user.can_library(track.library_id, Permissions::LIBRARY_EDIT_TAGS);
+        let own_upload = user.can_library(track.library_id, Permissions::LIBRARY_UPLOAD)
+            && track.uploaded_by == Some(user.id);
+
+        if !can_edit && !own_upload {
+            return Err(ApiError::new(StatusCode::FORBIDDEN, "permission denied"));
+        }
+    }
+
     let changes = serde_json::to_value(&request.changes)
         .map_err(|error| ApiError::new(StatusCode::BAD_REQUEST, error.to_string()))?;
     let edit = tag_edits::create(
@@ -109,8 +125,14 @@ pub async fn list(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<TagEditRecord>>, ApiError> {
-    auth::require_admin(&state, &headers).await?;
-    Ok(Json(tag_edits::list(&state.pool, 100).await?))
+    let user = auth::authenticate(&state, &headers).await?;
+    let edits = if user.is_admin() {
+        tag_edits::list(&state.pool, 100).await?
+    } else {
+        tag_edits::list_for_user(&state.pool, user.id, 100).await?
+    };
+
+    Ok(Json(edits))
 }
 
 pub async fn get(
@@ -118,10 +140,14 @@ pub async fn get(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Json<TagEditRecord>, ApiError> {
-    auth::require_admin(&state, &headers).await?;
-
-    tag_edits::get(&state.pool, id)
+    let user = auth::authenticate(&state, &headers).await?;
+    let edit = tag_edits::get(&state.pool, id)
         .await?
-        .map(Json)
-        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "tag edit not found"))
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "tag edit not found"))?;
+
+    if edit.user_id != user.id && !user.is_admin() {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "tag edit not found"));
+    }
+
+    Ok(Json(edit))
 }

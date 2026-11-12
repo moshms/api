@@ -17,6 +17,7 @@ pub struct Config {
     pub cookie_secure: bool,
     pub library_path: String,
     pub library_name: String,
+    pub library_access: String,
     pub scan_on_start: bool,
     pub transcoder_url: Option<String>,
     pub master_key: Option<String>,
@@ -39,6 +40,7 @@ impl Default for Config {
             cookie_secure: false,
             library_path: "/library".to_owned(),
             library_name: "Music".to_owned(),
+            library_access: "closed".to_owned(),
             scan_on_start: false,
             transcoder_url: None,
             master_key: None,
@@ -59,6 +61,10 @@ impl Config {
             bail!("MC_DATABASE_URL is required");
         }
 
+        if !matches!(config.library_access.as_str(), "closed" | "everyone") {
+            bail!("MC_LIBRARY_ACCESS must be closed or everyone");
+        }
+
         Ok(config)
     }
 }
@@ -76,6 +82,7 @@ mod tests {
         assert!(!config.metrics);
         assert_eq!(config.library_path, "/library");
         assert_eq!(config.library_name, "Music");
+        assert_eq!(config.library_access, "closed");
         assert_eq!(config.session_ttl_hours, 720);
         assert!(!config.cookie_secure);
     }

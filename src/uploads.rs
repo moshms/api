@@ -8,9 +8,11 @@ use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use bytes::Bytes;
 use futures_util::StreamExt;
+use mc_authz::Permissions;
 use mc_core::{CoreError, Result};
-use mc_db::repos::libraries;
+use mc_db::repos::media_files;
 use mc_db::repos::uploads::{self, UploadRecord};
+use mc_db::repos::{libraries, storages};
 use mc_scanner::ScanMode;
 use mc_storage::Key;
 use serde::Deserialize;
@@ -55,13 +57,6 @@ pub async fn create(
 ) -> Result<Response, ApiError> {
     let user = auth::authenticate(&state, &headers).await?;
 
-    if !user.role.can_upload() {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            "uploader or administrator role required",
-        ));
-    }
-
     if header(&headers, "tus-resumable") != Some(TUS_VERSION) {
         return Err(ApiError::new(
             StatusCode::PRECONDITION_FAILED,
@@ -81,7 +76,24 @@ pub async fn create(
         ));
     }
 
-    let library = resolve_library(&state, query.library_id).await?;
+    let library = resolve_library(&state, &user, query.library_id).await?;
+
+    if !user.can_library(library.id, Permissions::LIBRARY_UPLOAD) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "upload permission required for this library",
+        ));
+    }
+
+    let storage = storages::get(&state.pool, library.storage_id)
+        .await?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "library storage not found"))?;
+    if storage.access != "rw" {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "library storage is read-only",
+        ));
+    }
 
     if state
         .registry
@@ -311,7 +323,8 @@ async fn load_upload(state: &AppState, id: Uuid) -> Result<UploadRecord, ApiErro
 }
 
 fn authorize_upload(user: &auth::AuthUser, upload: &UploadRecord) -> Result<(), ApiError> {
-    if user.role.is_admin() || upload.user_id == user.id {
+    if upload.user_id == user.id || user.can_library(upload.library_id, Permissions::LIBRARY_UPLOAD)
+    {
         Ok(())
     } else {
         Err(ApiError::new(
@@ -323,6 +336,7 @@ fn authorize_upload(user: &auth::AuthUser, upload: &UploadRecord) -> Result<(), 
 
 async fn resolve_library(
     state: &AppState,
+    user: &auth::AuthUser,
     library_id: Option<Uuid>,
 ) -> Result<mc_db::repos::libraries::LibraryRecord, ApiError> {
     if let Some(library_id) = library_id {
@@ -331,13 +345,19 @@ async fn resolve_library(
             .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "library not found"));
     }
 
-    let libraries = libraries::list(&state.pool).await?;
+    let visible = user.visible_library_ids();
+    let libraries = libraries::list(&state.pool)
+        .await?
+        .into_iter()
+        .filter(|library| visible.contains(&library.id))
+        .collect::<Vec<_>>();
+
     libraries
         .iter()
         .find(|library| library.is_import_target)
         .or_else(|| libraries.first())
         .cloned()
-        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "no libraries configured"))
+        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "no uploadable libraries configured"))
 }
 
 async fn complete_upload(state: &AppState, upload: &UploadRecord) -> Result<()> {
@@ -413,12 +433,21 @@ async fn finalize(state: &AppState, upload: &UploadRecord) -> Result<Key> {
     let scanner = state.scanner.clone();
     let storage = storage.clone();
     let library_name = library.name.clone();
+    let pool = state.pool.clone();
+    let library_id = library.id;
+    let key_string = key.as_str().to_owned();
+    let user_id = upload.user_id;
     tokio::spawn(async move {
         match scanner
             .scan_library(&library, storage, ScanMode::Full)
             .await
         {
             Ok(stats) => {
+                if let Err(error) =
+                    media_files::set_uploaded_by(&pool, library_id, &key_string, user_id).await
+                {
+                    tracing::warn!(%error, "failed to record uploader on media file");
+                }
                 tracing::info!(library = %library_name, ?stats, "upload scan finished")
             }
             Err(error) => {

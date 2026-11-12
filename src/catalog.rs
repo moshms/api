@@ -5,13 +5,14 @@ use axum::http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::Json;
+use mc_authz::Permissions;
 use mc_db::repos::catalog;
 use mc_db::repos::libraries::{self, LibraryRecord};
 use mc_storage::{Delivery, Key};
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::auth;
+use crate::auth::{self, AuthUser};
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -30,16 +31,24 @@ pub async fn libraries(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<LibraryRecord>>, ApiError> {
-    auth::authenticate(&state, &headers).await?;
-    Ok(Json(libraries::list(&state.pool).await?))
+    let user = auth::authenticate(&state, &headers).await?;
+    let visible = user.visible_library_ids();
+    let libraries = libraries::list(&state.pool)
+        .await?
+        .into_iter()
+        .filter(|library| visible.contains(&library.id))
+        .collect::<Vec<_>>();
+
+    Ok(Json(libraries))
 }
 
 pub async fn artists(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<catalog::ArtistSummary>>, ApiError> {
-    auth::authenticate(&state, &headers).await?;
-    Ok(Json(catalog::list_artists(&state.pool).await?))
+    let user = auth::authenticate(&state, &headers).await?;
+    let visible = user.visible_library_ids();
+    Ok(Json(catalog::list_artists(&state.pool, &visible).await?))
 }
 
 pub async fn albums(
@@ -47,9 +56,10 @@ pub async fn albums(
     headers: HeaderMap,
     Query(query): Query<AlbumsQuery>,
 ) -> Result<Json<Vec<catalog::AlbumSummary>>, ApiError> {
-    auth::authenticate(&state, &headers).await?;
+    let user = auth::authenticate(&state, &headers).await?;
+    let visible = user.visible_library_ids();
     Ok(Json(
-        catalog::list_albums(&state.pool, query.artist_id).await?,
+        catalog::list_albums(&state.pool, query.artist_id, &visible).await?,
     ))
 }
 
@@ -58,9 +68,10 @@ pub async fn album(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Json<catalog::AlbumDetail>, ApiError> {
-    auth::authenticate(&state, &headers).await?;
+    let user = auth::authenticate(&state, &headers).await?;
+    let visible = user.visible_library_ids();
 
-    catalog::get_album(&state.pool, id)
+    catalog::get_album(&state.pool, id, &visible)
         .await?
         .map(Json)
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "album not found"))
@@ -71,9 +82,10 @@ pub async fn track(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Json<catalog::TrackDetail>, ApiError> {
-    auth::authenticate(&state, &headers).await?;
+    let user = auth::authenticate(&state, &headers).await?;
+    let visible = user.visible_library_ids();
 
-    catalog::get_track(&state.pool, id)
+    catalog::get_track(&state.pool, id, &visible)
         .await?
         .map(Json)
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "track not found"))
@@ -84,7 +96,8 @@ pub async fn search(
     headers: HeaderMap,
     Query(query): Query<SearchQuery>,
 ) -> Result<Json<catalog::SearchResults>, ApiError> {
-    auth::authenticate(&state, &headers).await?;
+    let user = auth::authenticate(&state, &headers).await?;
+    let visible = user.visible_library_ids();
     let query = query.q.trim();
 
     if query.is_empty() {
@@ -95,7 +108,9 @@ pub async fn search(
         }));
     }
 
-    Ok(Json(catalog::search(&state.pool, query, 20).await?))
+    Ok(Json(
+        catalog::search(&state.pool, query, 20, &visible).await?,
+    ))
 }
 
 pub async fn stream(
@@ -103,8 +118,8 @@ pub async fn stream(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
-    auth::authenticate(&state, &headers).await?;
-    file_response(&state, id, false).await
+    let user = auth::authenticate(&state, &headers).await?;
+    file_response(&state, &user, id, false).await
 }
 
 pub async fn download(
@@ -112,8 +127,8 @@ pub async fn download(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
-    auth::authenticate(&state, &headers).await?;
-    file_response(&state, id, true).await
+    let user = auth::authenticate(&state, &headers).await?;
+    file_response(&state, &user, id, true).await
 }
 
 pub async fn artwork(
@@ -121,9 +136,10 @@ pub async fn artwork(
     headers: HeaderMap,
     Path(album_id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
-    auth::authenticate(&state, &headers).await?;
+    let user = auth::authenticate(&state, &headers).await?;
+    let visible = user.visible_library_ids();
 
-    let artwork = catalog::get_album_artwork(&state.pool, album_id)
+    let artwork = catalog::get_album_artwork(&state.pool, album_id, &visible)
         .await?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "artwork not found"))?;
 
@@ -144,12 +160,23 @@ pub async fn artwork(
 
 async fn file_response(
     state: &AppState,
+    user: &AuthUser,
     track_id: Uuid,
     download: bool,
 ) -> Result<Response, ApiError> {
-    let track = catalog::get_track(&state.pool, track_id)
+    let visible = user.visible_library_ids();
+    let track = catalog::get_track(&state.pool, track_id, &visible)
         .await?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "track not found"))?;
+
+    let permission = if download {
+        Permissions::LIBRARY_DOWNLOAD
+    } else {
+        Permissions::LIBRARY_VIEW
+    };
+    if !user.can_library(track.library_id, permission) {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "track not found"));
+    }
 
     let key = Key::new(track.file_key.as_str())?;
     let storage = state
