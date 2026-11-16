@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::{Path as AxumPath, Query, State};
@@ -188,7 +189,8 @@ pub async fn patch(
         .and_then(|value| value.parse::<u64>().ok())
         .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Upload-Offset is required"))?;
 
-    let _guard = state.upload_lock.lock().await;
+    let lock = upload_lock(&state, id);
+    let _guard = lock.lock().await;
     let upload = load_upload(&state, id).await?;
     authorize_upload(&user, &upload)?;
 
@@ -296,8 +298,15 @@ pub async fn delete(
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     let user = auth::authenticate(&state, &headers).await?;
+    let lock = upload_lock(&state, id);
+    let _guard = lock.lock().await;
     let upload = load_upload(&state, id).await?;
-    authorize_upload(&user, &upload)?;
+    if upload.user_id != user.id && !user.is_admin() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "upload belongs to another user",
+        ));
+    }
 
     let staging_path = state.staging_path.join(&upload.staging_key);
     let _ = tokio::fs::remove_file(&staging_path).await;
@@ -323,8 +332,7 @@ async fn load_upload(state: &AppState, id: Uuid) -> Result<UploadRecord, ApiErro
 }
 
 fn authorize_upload(user: &auth::AuthUser, upload: &UploadRecord) -> Result<(), ApiError> {
-    if upload.user_id == user.id || user.can_library(upload.library_id, Permissions::LIBRARY_UPLOAD)
-    {
+    if upload.user_id == user.id {
         Ok(())
     } else {
         Err(ApiError::new(
@@ -332,6 +340,14 @@ fn authorize_upload(user: &auth::AuthUser, upload: &UploadRecord) -> Result<(), 
             "upload belongs to another user",
         ))
     }
+}
+
+fn upload_lock(state: &AppState, id: Uuid) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = state.upload_locks.lock().expect("upload lock map poisoned");
+    locks
+        .entry(id)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
 }
 
 async fn resolve_library(

@@ -17,6 +17,7 @@ use mc_proto::transcoder::TranscodeChunk;
 use mc_storage::{Delivery, Key};
 use rand::seq::SliceRandom;
 use serde_json::{json, Map, Value};
+use subtle::ConstantTimeEq;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
@@ -987,23 +988,41 @@ async fn authenticate(
     params: &SubsonicParams,
 ) -> Result<AuthUser, SubsonicError> {
     let username = params.get("u").ok_or_else(|| SubsonicError::missing("u"))?;
-    let user = users::find_by_username(&state.pool, username)
+    let limiter_key = format!("subsonic:{}", username.to_lowercase());
+
+    if state.login_limiter.blocked_for(&limiter_key).is_some() {
+        return Err(SubsonicError::auth());
+    }
+
+    let Some(user) = users::find_by_username(&state.pool, username)
         .await?
         .filter(|user| user.is_active)
-        .ok_or_else(SubsonicError::auth)?;
+    else {
+        state.login_limiter.record_failure(&limiter_key);
+        return Err(SubsonicError::auth());
+    };
 
     if let Some(password) = params.get("p") {
         let password = decode_password(password)?;
-        if !mc_auth::verify_password(&user.password_hash, &password)? {
+        let matches = password
+            .as_bytes()
+            .ct_eq(user.subsonic_secret.as_bytes())
+            .unwrap_u8()
+            == 1;
+        if !matches {
+            state.login_limiter.record_failure(&limiter_key);
             return Err(SubsonicError::auth());
         }
     } else if let (Some(token), Some(salt)) = (params.get("t"), params.get("s")) {
         if !mc_auth::verify_subsonic_token(&user.subsonic_secret, salt, token) {
+            state.login_limiter.record_failure(&limiter_key);
             return Err(SubsonicError::auth());
         }
     } else {
         return Err(SubsonicError::missing("p or t/s"));
     }
+
+    state.login_limiter.record_success(&limiter_key);
 
     let role = user
         .role

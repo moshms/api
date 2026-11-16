@@ -104,11 +104,38 @@ pub async fn update(
         None => Permissions::from_bits(u64::try_from(current.permissions.max(0)).unwrap_or(0)),
     };
 
+    if current.permissions & 1 != 0 && !actor.is_admin() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "only administrators can edit the administrator role",
+        ));
+    }
+
+    if current.permissions & 1 != 0 && !permissions.contains(Permissions::ADMINISTRATOR) {
+        let admin_roles = roles::list(&state.pool)
+            .await?
+            .into_iter()
+            .filter(|role| role.permissions & 1 != 0)
+            .count();
+        if admin_roles <= 1 {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "cannot remove the last administrator role",
+            ));
+        }
+    }
+
     if current.is_everyone {
         if request.name.is_some() || request.color.is_some() {
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
                 "the everyone role can only change permissions",
+            ));
+        }
+        if permissions.contains(Permissions::ADMINISTRATOR) {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "the everyone role cannot be administrator",
             ));
         }
         roles::update_everyone(

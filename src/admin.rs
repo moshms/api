@@ -295,6 +295,12 @@ pub async fn create_user(
     validate_password(&request.password)?;
 
     let role = parse_role(&request.role)?;
+    if role.is_admin() && !actor.is_admin() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "only administrators can create administrators",
+        ));
+    }
     let password_hash = mc_auth::hash_password(&request.password)?;
     let subsonic_secret = mc_auth::generate_secret();
     let user = users::create(
@@ -305,7 +311,7 @@ pub async fn create_user(
         role.as_str(),
     )
     .await?;
-    sync_legacy_role(&state.pool, user.id, role.as_str()).await?;
+    sync_legacy_role(&state.pool, user.id, role.as_str(), actor.is_admin()).await?;
 
     audit::log(
         &state.pool,
@@ -342,7 +348,20 @@ pub async fn update_user(
         return Err(ApiError::new(StatusCode::NOT_FOUND, "user not found"));
     };
 
+    if roles::has_admin_role(&state.pool, id).await? && !actor.is_admin() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "only administrators can edit administrators",
+        ));
+    }
+
     let role = request.role.as_deref().map(parse_role).transpose()?;
+    if role.is_some_and(Role::is_admin) && !actor.is_admin() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "only administrators can grant the administrator role",
+        ));
+    }
     let new_role = role.map_or_else(|| current.role.clone(), |role| role.as_str().to_owned());
     let new_active = request.is_active.unwrap_or(current.is_active);
 
@@ -359,7 +378,7 @@ pub async fn update_user(
 
     if role.is_some() {
         users::update_role(&state.pool, id, &new_role).await?;
-        sync_legacy_role(&state.pool, id, &new_role).await?;
+        sync_legacy_role(&state.pool, id, &new_role, actor.is_admin()).await?;
     }
 
     if request.is_active.is_some() {
@@ -413,6 +432,13 @@ pub async fn delete_user(
     let Some(user) = users::get(&state.pool, id).await? else {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "user not found"));
     };
+
+    if roles::has_admin_role(&state.pool, id).await? && !current.is_admin() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "only administrators can delete administrators",
+        ));
+    }
 
     if user.is_active
         && roles::has_admin_role(&state.pool, id).await?
@@ -473,7 +499,19 @@ fn validate_password(password: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-async fn sync_legacy_role(pool: &mc_db::PgPool, user_id: Uuid, role: &str) -> Result<(), ApiError> {
+async fn sync_legacy_role(
+    pool: &mc_db::PgPool,
+    user_id: Uuid,
+    role: &str,
+    actor_is_admin: bool,
+) -> Result<(), ApiError> {
+    if role == "admin" && !actor_is_admin {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "only administrators can grant the administrator role",
+        ));
+    }
+
     let all_roles = roles::list(pool).await?;
     let admin_role = all_roles
         .iter()

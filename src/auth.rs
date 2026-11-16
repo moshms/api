@@ -5,9 +5,10 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use mc_authz::Permissions;
 use mc_core::Role;
-use mc_db::repos::roles::{self, RoleRecord};
+use mc_db::repos::roles::RoleRecord;
 use mc_db::repos::{api_tokens, sessions, users};
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -98,12 +99,15 @@ pub struct LoginRequest {
 #[derive(Debug, Serialize)]
 pub struct SetupStatus {
     pub required: bool,
+    pub token_required: bool,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct SetupRequest {
     pub username: String,
     pub password: String,
+    #[serde(default)]
+    pub setup_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -147,23 +151,21 @@ pub async fn ensure_admin(pool: &mc_db::PgPool, config: &Config) -> anyhow::Resu
 
     let password_hash = mc_auth::hash_password(password)?;
     let subsonic_secret = mc_auth::generate_secret();
-    let user = users::create(
-        pool,
-        username,
-        &password_hash,
-        &subsonic_secret,
-        Role::Admin.as_str(),
-    )
-    .await?;
-    assign_admin_role(pool, user.id).await?;
 
-    info!(%username, "created initial administrator");
+    if let Some(user) = create_first_admin(pool, username, &password_hash, &subsonic_secret).await?
+    {
+        info!(%username, "created initial administrator");
+        let _ = user;
+    }
+
     Ok(())
 }
 
 pub async fn setup_status(State(state): State<AppState>) -> Result<Json<SetupStatus>, ApiError> {
+    let required = users::count(&state.pool).await? == 0;
     Ok(Json(SetupStatus {
-        required: users::count(&state.pool).await? == 0,
+        required,
+        token_required: required && state.setup_token.is_some(),
     }))
 }
 
@@ -172,10 +174,24 @@ pub async fn setup(
     headers: HeaderMap,
     Json(request): Json<SetupRequest>,
 ) -> Result<Response, ApiError> {
-    if users::count(&state.pool).await? > 0 {
+    let expected = state
+        .setup_token
+        .as_deref()
+        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "setup is already complete"))?;
+    let provided = request
+        .setup_token
+        .as_deref()
+        .or_else(|| {
+            headers
+                .get("x-setup-token")
+                .and_then(|value| value.to_str().ok())
+        })
+        .unwrap_or("");
+
+    if provided.as_bytes().ct_eq(expected.as_bytes()).unwrap_u8() != 1 {
         return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "setup is already complete",
+            StatusCode::UNAUTHORIZED,
+            "invalid setup token",
         ));
     }
 
@@ -191,17 +207,10 @@ pub async fn setup(
 
     let password_hash = mc_auth::hash_password(&request.password)?;
     let subsonic_secret = mc_auth::generate_secret();
-    let user = users::create(
-        &state.pool,
-        username,
-        &password_hash,
-        &subsonic_secret,
-        Role::Admin.as_str(),
-    )
-    .await?;
-    assign_admin_role(&state.pool, user.id)
+    let user = create_first_admin(&state.pool, username, &password_hash, &subsonic_secret)
         .await
-        .map_err(|error| ApiError::internal(error.to_string()))?;
+        .map_err(|error| ApiError::internal(error.to_string()))?
+        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "setup is already complete"))?;
 
     info!(%username, "created initial administrator via setup");
     issue_session(&state, &headers, &user).await
@@ -212,18 +221,32 @@ pub async fn login(
     headers: HeaderMap,
     Json(request): Json<LoginRequest>,
 ) -> Result<Response, ApiError> {
+    let key = login_key(&headers, request.username.trim());
+    if let Some(remaining) = state.login_limiter.blocked_for(&key) {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "too many login attempts, retry in {} seconds",
+                remaining.as_secs().max(1)
+            ),
+        ));
+    }
+
     let user = users::find_by_username(&state.pool, request.username.trim())
         .await?
         .filter(|user| user.is_active);
 
     let Some(user) = user else {
+        state.login_limiter.record_failure(&key);
         return Err(invalid_credentials());
     };
 
     if !mc_auth::verify_password(&user.password_hash, &request.password)? {
+        state.login_limiter.record_failure(&key);
         return Err(invalid_credentials());
     }
 
+    state.login_limiter.record_success(&key);
     issue_session(&state, &headers, &user).await
 }
 
@@ -483,19 +506,60 @@ fn user_dto(user: &users::UserRecord, authz: &AuthzContext) -> UserDto {
     }
 }
 
-async fn assign_admin_role(pool: &mc_db::PgPool, user_id: Uuid) -> anyhow::Result<()> {
-    let roles = roles::list(pool).await?;
-    let admin = roles
-        .iter()
-        .find(|role| !role.is_everyone && role.permissions & 1 != 0);
+async fn create_first_admin(
+    pool: &mc_db::PgPool,
+    username: &str,
+    password_hash: &str,
+    subsonic_secret: &str,
+) -> anyhow::Result<Option<users::UserRecord>> {
+    let mut transaction = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(42424242)")
+        .execute(&mut *transaction)
+        .await?;
 
-    if let Some(admin) = admin {
-        roles::assign(pool, user_id, admin.id).await?;
-    } else {
-        warn!("administrator role is missing; user has no administrator permissions");
+    let count = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM users")
+        .fetch_one(&mut *transaction)
+        .await?;
+    if count > 0 {
+        transaction.rollback().await?;
+        return Ok(None);
     }
 
-    Ok(())
+    let user = sqlx::query_as::<_, users::UserRecord>(
+        "INSERT INTO users (id, username, password_hash, subsonic_secret, role)
+         VALUES ($1, $2, $3, $4, 'admin')
+         RETURNING id, username, password_hash, subsonic_secret, role, is_active",
+    )
+    .bind(Uuid::now_v7())
+    .bind(username)
+    .bind(password_hash)
+    .bind(subsonic_secret)
+    .fetch_one(&mut *transaction)
+    .await?;
+
+    let admin_role = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM roles
+         WHERE NOT is_everyone AND (permissions & 1) <> 0
+         LIMIT 1",
+    )
+    .fetch_optional(&mut *transaction)
+    .await?;
+
+    let Some(admin_role) = admin_role else {
+        anyhow::bail!("administrator role is missing");
+    };
+
+    sqlx::query(
+        "INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2)
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(user.id)
+    .bind(admin_role)
+    .execute(&mut *transaction)
+    .await?;
+
+    transaction.commit().await?;
+    Ok(Some(user))
 }
 
 fn validate_password(password: &str) -> Result<(), ApiError> {
@@ -523,6 +587,21 @@ fn role_from_str(value: &str) -> Result<Role, ApiError> {
             "invalid user role in database",
         )
     })
+}
+
+fn login_key(headers: &HeaderMap, username: &str) -> String {
+    let ip = headers
+        .get("x-real-ip")
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| {
+            headers
+                .get("x-forwarded-for")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(',').next())
+        })
+        .unwrap_or("-");
+
+    format!("{}:{ip}", username.to_lowercase())
 }
 
 fn invalid_credentials() -> ApiError {
