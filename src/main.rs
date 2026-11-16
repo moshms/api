@@ -8,6 +8,7 @@ mod favorites;
 mod permissions;
 mod playlists;
 mod probe;
+mod rate_limit;
 mod roles;
 mod state;
 mod subsonic;
@@ -29,18 +30,19 @@ use config::Config;
 use error::ApiError;
 use mc_authz::Permissions;
 use mc_crypto::MasterKey;
-use mc_db::repos::{libraries, permissions as db_permissions, roles as db_roles};
+use mc_db::repos::{libraries, permissions as db_permissions, roles as db_roles, users};
 use mc_db::PgPool;
 use mc_media::LoftyParser;
 use mc_runtime::StorageRegistry;
 use mc_scanner::{ScanMode, ScanStats, Scanner};
 use mc_telemetry::{check_fn, Health, TelemetryConfig};
+use rate_limit::LoginLimiter;
 use serde::Serialize;
 use state::AppState;
 use tokio::net::TcpListener;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use transcoder::TranscoderClient;
 use uuid::Uuid;
 
@@ -139,19 +141,34 @@ async fn main() -> anyhow::Result<()> {
         .filter(|url| !url.is_empty())
         .map(TranscoderClient::new);
 
+    let setup_token = if users::count(&pool).await? == 0 {
+        let token = config
+            .setup_token
+            .clone()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(mc_auth::generate_token);
+        warn!(setup_token = %token, "initial setup token generated; use it on /setup");
+        Some(token)
+    } else {
+        None
+    };
+
     let state = AppState {
         pool: pool.clone(),
         scanner,
         registry: Arc::new(tokio::sync::RwLock::new(registry)),
         master_key,
         session_ttl_hours: config.session_ttl_hours,
+        setup_token,
+        login_limiter: Arc::new(LoginLimiter::new()),
         cookie_secure: config.cookie_secure,
         scan_lock: Arc::new(tokio::sync::Mutex::new(())),
         transcoder,
         metrics: metrics_handle,
         staging_path: std::path::PathBuf::from(&config.staging_path),
         max_upload_bytes: config.max_upload_bytes,
-        upload_lock: Arc::new(tokio::sync::Mutex::new(())),
+        upload_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
     if config.scan_on_start {

@@ -1,0 +1,64 @@
+name: security
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  security-smoke:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: musiccloud
+          POSTGRES_USER: musiccloud
+          POSTGRES_PASSWORD: testpass
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U musiccloud -d musiccloud"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure core access
+        run: |
+          git config --global url."https://x-access-token:${CORE_READ_TOKEN}@github.com/moshms/core.git".insteadOf "ssh://git@github.com/moshms/core.git"
+        env:
+          CORE_READ_TOKEN: ${{ secrets.CORE_READ_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --all-features
+      - name: Run security smoke
+        run: |
+          mkdir -p /tmp/mc-library /tmp/mc-staging
+          MC_BIND_ADDR=127.0.0.1:18086 \
+          MC_DATABASE_URL=postgres://musiccloud:testpass@127.0.0.1:5432/musiccloud \
+          MC_DATABASE_MAX_CONNECTIONS=5 \
+          MC_LOG_JSON=false MC_LOG_FILTER=warn MC_METRICS=false \
+          MC_ADMIN_USER=admin MC_ADMIN_PASSWORD= \
+          MC_SETUP_TOKEN=setup-token \
+          MC_SESSION_TTL_HOURS=720 MC_COOKIE_SECURE=false \
+          MC_LIBRARY_PATH=/tmp/mc-library MC_LIBRARY_NAME=Music \
+          MC_LIBRARY_ACCESS=closed MC_SCAN_ON_START=false \
+          MC_STAGING_PATH=/tmp/mc-staging \
+          ./target/debug/mc-api > /tmp/mc-api.log 2>&1 &
+          API_PID=$!
+          trap 'kill $API_PID 2>/dev/null || true' EXIT
+          for i in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:18086/readyz >/dev/null; then break; fi
+            sleep 1
+          done
+          python3 scripts/security_smoke.py
