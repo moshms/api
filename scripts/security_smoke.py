@@ -81,11 +81,15 @@ def main():
     )
     expect(status == 401, "setup with wrong token must fail")
 
-    admin = client()
+    def setup_attempt(_):
+        opener = client()
+        return setup_once(opener), opener
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        results = list(executor.map(lambda _: setup_once(admin), range(2)))
-    statuses = sorted(status for status, _ in results)
+        results = list(executor.map(setup_attempt, range(2)))
+    statuses = sorted(result[0][0] for result in results)
     expect(statuses == [200, 409], f"setup race must yield 200/409, got {statuses}")
+    admin = next(opener for (status, _), opener in results if status == 200)
 
     status, me = call(admin, "GET", "/api/v1/auth/me")
     expect(status == 200 and me["username"] == "admin", "admin session failed")
