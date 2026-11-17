@@ -16,7 +16,7 @@ use mc_db::repos::{libraries, storages};
 use mc_scanner::ScanMode;
 use mc_storage::Key;
 use serde::Deserialize;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
@@ -394,6 +394,58 @@ async fn complete_upload(state: &AppState, upload: &UploadRecord) -> Result<()> 
     Ok(())
 }
 
+const AUDIO_EXTENSIONS: &[&str] = &[
+    "aac", "aif", "aiff", "ape", "flac", "m4a", "mp3", "mp4", "oga", "ogg", "opus", "wav", "wma",
+    "wv",
+];
+
+async fn validate_audio_file(path: &Path, filename: &str) -> Result<()> {
+    let extension = Path::new(filename)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .ok_or_else(|| CoreError::Validation("upload must have an audio extension".to_owned()))?;
+
+    if !AUDIO_EXTENSIONS.contains(&extension.as_str()) {
+        return Err(CoreError::Validation(format!(
+            "unsupported audio extension: {extension}"
+        )));
+    }
+
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|error| CoreError::Unavailable(format!("open upload: {error}")))?;
+    let mut header = [0u8; 16];
+    let read = file
+        .read(&mut header)
+        .await
+        .map_err(|error| CoreError::Unavailable(format!("read upload header: {error}")))?;
+    let header = &header[..read];
+
+    let matches = match extension.as_str() {
+        "mp3" => {
+            header.starts_with(b"ID3") || header.first().is_some_and(|byte| byte & 0xE0 == 0xE0)
+        }
+        "flac" => header.starts_with(b"fLaC"),
+        "ogg" | "oga" | "opus" => header.starts_with(b"OggS"),
+        "wav" => header.starts_with(b"RIFF") && header.get(8..12) == Some(b"WAVE"),
+        "m4a" | "mp4" | "aac" => header.get(4..8) == Some(b"ftyp"),
+        "wma" => header.starts_with(&[0x30, 0x26, 0xB2, 0x75]),
+        "ape" => header.starts_with(b"MAC "),
+        "aif" | "aiff" => header.starts_with(b"FORM"),
+        "wv" => header.starts_with(b"wvpk"),
+        _ => false,
+    };
+
+    if !matches {
+        return Err(CoreError::Validation(
+            "uploaded file does not match its audio format".to_owned(),
+        ));
+    }
+
+    Ok(())
+}
+
 async fn stream_staging(
     storage: &dyn mc_storage::Storage,
     key: &Key,
@@ -422,6 +474,8 @@ async fn finalize(state: &AppState, upload: &UploadRecord) -> Result<Key> {
         .ok_or_else(|| CoreError::Unavailable("library storage is unavailable".to_owned()))?;
 
     let filename = sanitize_filename(&upload.filename);
+    let staging_path = state.staging_path.join(&upload.staging_key);
+    validate_audio_file(&staging_path, &filename).await?;
     let mut key = Key::new(format!("uploads/{}/{}", upload.user_id, filename))?;
 
     match storage.stat(&key).await {
@@ -434,8 +488,6 @@ async fn finalize(state: &AppState, upload: &UploadRecord) -> Result<Key> {
         Err(CoreError::NotFound { .. }) => {}
         Err(error) => return Err(error),
     }
-
-    let staging_path = state.staging_path.join(&upload.staging_key);
 
     if let Some(destination) = storage.local_path(&key) {
         if let Some(parent) = destination.parent() {
