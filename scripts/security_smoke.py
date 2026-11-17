@@ -93,6 +93,7 @@ def main():
 
     status, me = call(admin, "GET", "/api/v1/auth/me")
     expect(status == 200 and me["username"] == "admin", "admin session failed")
+    admin_id = me["id"]
 
     status, role = call(
         admin,
@@ -140,6 +141,22 @@ def main():
     admin_role = next(role for role in roles if role["permissions"] & 1)
     status, _ = call(manager, "PATCH", f"/api/v1/roles/{admin_role['id']}", {"permissions": 0})
     expect(status == 403, "manage_roles edited the administrator role")
+
+    status, _ = call(
+        manager,
+        "POST",
+        "/api/v1/roles",
+        {"name": "LibrarySneak", "permissions": 1 << 10},
+    )
+    expect(status == 403, "manage_roles granted library permissions through a role")
+
+    status, _ = call(
+        admin,
+        "PATCH",
+        f"/api/v1/admin/users/{admin_id}",
+        {"role": "listener"},
+    )
+    expect(status == 409, "last administrator could be demoted")
 
     bad = client()
     for attempt in range(5):
