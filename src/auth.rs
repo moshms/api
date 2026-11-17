@@ -617,9 +617,9 @@ async fn create_first_admin(
     }
 
     let user = sqlx::query_as::<_, users::UserRecord>(
-        "INSERT INTO users (id, username, password_hash, subsonic_secret, role)
-         VALUES ($1, $2, $3, $4, 'admin')
-         RETURNING id, username, password_hash, subsonic_secret, role, is_active",
+        "INSERT INTO users (id, username, password_hash, subsonic_secret)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, username, password_hash, subsonic_secret, is_active",
     )
     .bind(Uuid::now_v7())
     .bind(username)
