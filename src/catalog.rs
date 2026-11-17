@@ -26,6 +26,20 @@ use crate::state::AppState;
 #[derive(Debug, Deserialize)]
 pub struct AlbumsQuery {
     pub artist_id: Option<Uuid>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub offset: Option<i64>,
+    #[serde(default)]
+    pub sort: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ArtistsQuery {
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub offset: Option<i64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -38,6 +52,8 @@ pub struct SearchQuery {
 pub struct ArtistTracksQuery {
     #[serde(default)]
     pub limit: Option<i64>,
+    #[serde(default)]
+    pub offset: Option<i64>,
 }
 
 pub async fn libraries(
@@ -58,22 +74,42 @@ pub async fn libraries(
 pub async fn artists(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<Vec<catalog::ArtistSummary>>, ApiError> {
+    Query(query): Query<ArtistsQuery>,
+) -> Result<Response, ApiError> {
     let user = auth::authenticate(&state, &headers).await?;
     let visible = user.visible_library_ids();
-    Ok(Json(catalog::list_artists(&state.pool, &visible).await?))
+    let limit = query.limit.map(|value| value.clamp(1, 500));
+    let offset = query.offset.unwrap_or(0).max(0);
+    let total = catalog::count_artists(&state.pool, &visible).await?;
+    let artists = catalog::list_artists_page(&state.pool, &visible, limit, offset).await?;
+
+    Ok(paginated(artists, total, limit, offset))
 }
 
 pub async fn albums(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AlbumsQuery>,
-) -> Result<Json<Vec<catalog::AlbumSummary>>, ApiError> {
+) -> Result<Response, ApiError> {
     let user = auth::authenticate(&state, &headers).await?;
     let visible = user.visible_library_ids();
-    Ok(Json(
-        catalog::list_albums(&state.pool, query.artist_id, &visible).await?,
-    ))
+    let limit = query.limit.map(|value| value.clamp(1, 500));
+    let offset = query.offset.unwrap_or(0).max(0);
+    let sort = match query.sort.as_deref().unwrap_or("artist") {
+        "name" | "artist" | "year" => query.sort.as_deref().unwrap_or("artist"),
+        _ => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "sort must be name, artist or year",
+            ))
+        }
+    };
+    let total = catalog::count_albums(&state.pool, query.artist_id, &visible).await?;
+    let albums =
+        catalog::list_albums_page(&state.pool, query.artist_id, &visible, limit, offset, sort)
+            .await?;
+
+    Ok(paginated(albums, total, limit, offset))
 }
 
 pub async fn artist_tracks(
@@ -85,10 +121,38 @@ pub async fn artist_tracks(
     let user = auth::authenticate(&state, &headers).await?;
     let visible = user.visible_library_ids();
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
+    let offset = query.offset.unwrap_or(0).max(0);
 
     Ok(Json(
-        catalog::list_artist_tracks(&state.pool, id, &visible, limit).await?,
+        catalog::list_artist_tracks_page(&state.pool, id, &visible, limit, offset).await?,
     ))
+}
+
+fn paginated<T: serde::Serialize>(
+    items: T,
+    total: i64,
+    limit: Option<i64>,
+    offset: i64,
+) -> Response {
+    let mut response = Json(items).into_response();
+    response.headers_mut().insert(
+        HeaderName::from_static("x-total-count"),
+        HeaderValue::from_str(&total.to_string()).unwrap_or_else(|_| HeaderValue::from_static("0")),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-offset"),
+        HeaderValue::from_str(&offset.to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("0")),
+    );
+    if let Some(limit) = limit {
+        response.headers_mut().insert(
+            HeaderName::from_static("x-limit"),
+            HeaderValue::from_str(&limit.to_string())
+                .unwrap_or_else(|_| HeaderValue::from_static("0")),
+        );
+    }
+
+    response
 }
 
 pub async fn album(
