@@ -5,7 +5,7 @@ use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::header::{
     ACCEPT_RANGES, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE,
-    RANGE,
+    ETAG, IF_NONE_MATCH, RANGE,
 };
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
@@ -170,6 +170,20 @@ pub async fn artwork(
     let artwork = catalog::get_album_artwork(&state.pool, album_id, &visible)
         .await?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "artwork not found"))?;
+    let etag = format!("\"{}\"", artwork.etag);
+
+    if headers
+        .get(IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        == Some(etag.as_str())
+    {
+        let mut response = StatusCode::NOT_MODIFIED.into_response();
+        response.headers_mut().insert(
+            ETAG,
+            HeaderValue::from_str(&etag).map_err(|_| ApiError::internal("invalid artwork etag"))?,
+        );
+        return Ok(response);
+    }
 
     let mut response = artwork.data.into_response();
     response.headers_mut().insert(
@@ -180,7 +194,11 @@ pub async fn artwork(
     );
     response.headers_mut().insert(
         CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=86400"),
+        HeaderValue::from_static("private, max-age=86400"),
+    );
+    response.headers_mut().insert(
+        ETAG,
+        HeaderValue::from_str(&etag).map_err(|_| ApiError::internal("invalid artwork etag"))?,
     );
 
     Ok(response)
@@ -380,14 +398,26 @@ fn set_download_headers(
     file_key: &str,
     title: &str,
 ) -> Result<(), ApiError> {
-    let filename = download_filename(file_key, title);
     response.headers_mut().insert(
         CONTENT_DISPOSITION,
-        HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+        HeaderValue::from_str(&content_disposition(file_key, title))
             .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "invalid filename"))?,
     );
 
     Ok(())
+}
+
+pub(crate) fn content_disposition(file_key: &str, title: &str) -> String {
+    let fallback = download_filename(file_key, title);
+    let extension = FsPath::new(file_key)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| format!(".{value}"))
+        .unwrap_or_default();
+    let utf8 = format!("{title}{extension}");
+    let encoded = form_urlencoded::byte_serialize(utf8.as_bytes()).collect::<String>();
+
+    format!("attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}")
 }
 
 pub(crate) fn download_filename(file_key: &str, title: &str) -> String {
