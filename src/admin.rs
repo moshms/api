@@ -12,6 +12,7 @@ use mc_db::repos::users::{self, UserSummary};
 use mc_storage::Key;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::auth::{self, RoleDto};
@@ -208,22 +209,41 @@ pub async fn create_library(
 
     let root_prefix = request.root_prefix.unwrap_or_default();
     Key::new(root_prefix.as_str())?;
+    let access_targets = resolve_library_access(&state, request.access.as_ref()).await?;
 
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
     let library = libraries::create(
-        &state.pool,
+        &mut *tx,
         name,
         request.storage_id,
         &root_prefix,
         request.is_import_target.unwrap_or(false),
     )
     .await?;
-
-    apply_library_access(&state, library.id, request.access.as_ref()).await?;
-    reload_registry(&state).await?;
-    state.authz_cache.clear();
-
+    let allow = i64::try_from(
+        Permissions::LIBRARY_VIEW
+            .union(Permissions::LIBRARY_DOWNLOAD)
+            .bits(),
+    )
+    .unwrap_or(i64::MAX);
+    for (target_type, target_id) in &access_targets {
+        permissions::upsert(
+            &mut *tx,
+            "library",
+            library.id,
+            target_type,
+            *target_id,
+            allow,
+            0,
+        )
+        .await?;
+    }
     audit::log(
-        &state.pool,
+        &mut *tx,
         Some(actor.id),
         "library.create",
         "library",
@@ -231,6 +251,12 @@ pub async fn create_library(
         json!({ "name": library.name, "access": request.access }),
     )
     .await?;
+    tx.commit()
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+
+    reload_registry(&state).await?;
+    state.authz_cache.clear();
 
     Ok((StatusCode::CREATED, Json(library)))
 }
@@ -240,11 +266,28 @@ pub async fn delete_library(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    auth::require_permission(&state, &headers, Permissions::MANAGE_LIBRARIES).await?;
+    let actor = auth::require_permission(&state, &headers, Permissions::MANAGE_LIBRARIES).await?;
 
-    if !libraries::delete(&state.pool, id).await? {
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    if !libraries::delete(&mut *tx, id).await? {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "library not found"));
     }
+    audit::log(
+        &mut *tx,
+        Some(actor.id),
+        "library.delete",
+        "library",
+        Some(id),
+        json!({}),
+    )
+    .await?;
+    tx.commit()
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
 
     reload_registry(&state).await?;
     state.authz_cache.clear();
@@ -327,12 +370,15 @@ pub async fn create_user(
     }
     let password_hash = mc_auth::hash_password(&request.password)?;
     let subsonic_secret = mc_auth::generate_secret();
-    let user = users::create(&state.pool, username, &password_hash, &subsonic_secret).await?;
-    sync_legacy_role(&state.pool, user.id, role.as_str(), actor.is_admin()).await?;
-    state.authz_cache.invalidate(user.id);
-
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let user = users::create(&mut *tx, username, &password_hash, &subsonic_secret).await?;
+    sync_legacy_role(&mut tx, user.id, role.as_str(), actor.is_admin()).await?;
     audit::log(
-        &state.pool,
+        &mut *tx,
         Some(actor.id),
         "user.create",
         "user",
@@ -340,6 +386,10 @@ pub async fn create_user(
         json!({ "username": user.username, "role": role.as_str() }),
     )
     .await?;
+    tx.commit()
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    state.authz_cache.invalidate(user.id);
 
     let summary = UserSummary {
         id: user.id,
@@ -394,34 +444,45 @@ pub async fn update_user(
         ));
     }
 
+    if let Some(password) = request.password.as_deref() {
+        validate_password(password)?;
+    }
+
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
     if let Some(role) = role {
-        sync_legacy_role(&state.pool, id, role.as_str(), actor.is_admin()).await?;
+        sync_legacy_role(&mut tx, id, role.as_str(), actor.is_admin()).await?;
     }
 
     if request.is_active.is_some() {
-        users::update_active(&state.pool, id, new_active).await?;
+        users::update_active(&mut *tx, id, new_active).await?;
     }
 
     if let Some(password) = request.password.as_deref() {
-        validate_password(password)?;
         let password_hash = mc_auth::hash_password(password)?;
-        users::update_password(&state.pool, id, &password_hash).await?;
+        users::update_password(&mut *tx, id, &password_hash).await?;
     }
+
+    audit::log(
+        &mut *tx,
+        Some(actor.id),
+        "user.update",
+        "user",
+        Some(id),
+        json!({ "is_active": new_active }),
+    )
+    .await?;
+    tx.commit()
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
     state.authz_cache.invalidate(id);
 
     let user = users::get(&state.pool, id)
         .await?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "user not found"))?;
-
-    audit::log(
-        &state.pool,
-        Some(actor.id),
-        "user.update",
-        "user",
-        Some(id),
-        json!({ "is_active": user.is_active }),
-    )
-    .await?;
 
     let summary = UserSummary {
         id: user.id,
@@ -467,21 +528,28 @@ pub async fn delete_user(
         ));
     }
 
-    if users::delete(&state.pool, id).await? {
-        state.authz_cache.invalidate(id);
-        audit::log(
-            &state.pool,
-            Some(current.id),
-            "user.delete",
-            "user",
-            Some(id),
-            json!({ "username": user.username }),
-        )
-        .await?;
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err(ApiError::new(StatusCode::NOT_FOUND, "user not found"))
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    if !users::delete(&mut *tx, id).await? {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "user not found"));
     }
+    audit::log(
+        &mut *tx,
+        Some(current.id),
+        "user.delete",
+        "user",
+        Some(id),
+        json!({ "username": user.username }),
+    )
+    .await?;
+    tx.commit()
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    state.authz_cache.invalidate(id);
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn admin_user_dto(
@@ -518,7 +586,7 @@ fn validate_password(password: &str) -> Result<(), ApiError> {
 }
 
 async fn sync_legacy_role(
-    pool: &mc_db::PgPool,
+    conn: &mut PgConnection,
     user_id: Uuid,
     role: &str,
     actor_is_admin: bool,
@@ -530,7 +598,7 @@ async fn sync_legacy_role(
         ));
     }
 
-    let all_roles = roles::list(pool).await?;
+    let all_roles = roles::list(&mut *conn).await?;
     let admin_role = all_roles
         .iter()
         .find(|role| !role.is_everyone && role.permissions & 1 != 0);
@@ -541,26 +609,26 @@ async fn sync_legacy_role(
     match role {
         "admin" => {
             if let Some(role) = admin_role {
-                roles::assign(pool, user_id, role.id).await?;
+                roles::assign(&mut *conn, user_id, role.id).await?;
             }
             if let Some(role) = uploader_role {
-                let _ = roles::unassign(pool, user_id, role.id).await?;
+                let _ = roles::unassign(&mut *conn, user_id, role.id).await?;
             }
         }
         "uploader" => {
             if let Some(role) = uploader_role {
-                roles::assign(pool, user_id, role.id).await?;
+                roles::assign(&mut *conn, user_id, role.id).await?;
             }
             if let Some(role) = admin_role {
-                let _ = roles::unassign(pool, user_id, role.id).await?;
+                let _ = roles::unassign(&mut *conn, user_id, role.id).await?;
             }
         }
         _ => {
             if let Some(role) = admin_role {
-                let _ = roles::unassign(pool, user_id, role.id).await?;
+                let _ = roles::unassign(&mut *conn, user_id, role.id).await?;
             }
             if let Some(role) = uploader_role {
-                let _ = roles::unassign(pool, user_id, role.id).await?;
+                let _ = roles::unassign(&mut *conn, user_id, role.id).await?;
             }
         }
     }
@@ -568,71 +636,37 @@ async fn sync_legacy_role(
     Ok(())
 }
 
-async fn apply_library_access(
+async fn resolve_library_access(
     state: &AppState,
-    library_id: Uuid,
     access: Option<&LibraryAccessRequest>,
-) -> Result<(), ApiError> {
+) -> Result<Vec<(&'static str, Uuid)>, ApiError> {
     let Some(access) = access else {
-        return Ok(());
+        return Ok(Vec::new());
     };
 
-    let allow = i64::try_from(
-        Permissions::LIBRARY_VIEW
-            .union(Permissions::LIBRARY_DOWNLOAD)
-            .bits(),
-    )
-    .unwrap_or(i64::MAX);
-
+    let mut targets = Vec::new();
     if access.everyone {
         let everyone = roles::everyone(&state.pool)
             .await?
             .ok_or_else(|| ApiError::internal("everyone role is missing"))?;
-        permissions::upsert(
-            &state.pool,
-            "library",
-            library_id,
-            "role",
-            everyone.id,
-            allow,
-            0,
-        )
-        .await?;
+        targets.push(("role", everyone.id));
     }
 
     for role_id in &access.roles {
         if roles::get(&state.pool, *role_id).await?.is_none() {
             return Err(ApiError::new(StatusCode::NOT_FOUND, "role not found"));
         }
-        permissions::upsert(
-            &state.pool,
-            "library",
-            library_id,
-            "role",
-            *role_id,
-            allow,
-            0,
-        )
-        .await?;
+        targets.push(("role", *role_id));
     }
 
     for user_id in &access.users {
         if users::get(&state.pool, *user_id).await?.is_none() {
             return Err(ApiError::new(StatusCode::NOT_FOUND, "user not found"));
         }
-        permissions::upsert(
-            &state.pool,
-            "library",
-            library_id,
-            "user",
-            *user_id,
-            allow,
-            0,
-        )
-        .await?;
+        targets.push(("user", *user_id));
     }
 
-    Ok(())
+    Ok(targets)
 }
 
 fn parse_role(value: &str) -> Result<Role, ApiError> {
