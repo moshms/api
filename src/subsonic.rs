@@ -1028,7 +1028,7 @@ async fn authenticate(
         .role
         .parse::<Role>()
         .map_err(|_| SubsonicError::internal())?;
-    let authz = authz::load(&state.pool, user.id)
+    let authz = authz::load_cached(&state.pool, &state.authz_cache, user.id)
         .await
         .map_err(|_| SubsonicError::internal())?;
 

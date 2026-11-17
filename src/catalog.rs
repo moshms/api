@@ -1,7 +1,12 @@
 use std::path::Path as FsPath;
 
+use axum::body::Body;
+
 use axum::extract::{Path, Query, State};
-use axum::http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE};
+use axum::http::header::{
+    ACCEPT_RANGES, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE,
+    RANGE,
+};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::Json;
@@ -10,6 +15,8 @@ use mc_db::repos::catalog;
 use mc_db::repos::libraries::{self, LibraryRecord};
 use mc_storage::{Delivery, Key};
 use serde::Deserialize;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
+use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 use crate::auth::{self, AuthUser};
@@ -119,7 +126,7 @@ pub async fn stream(
     Path(id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
     let user = auth::authenticate(&state, &headers).await?;
-    file_response(&state, &user, id, false).await
+    file_response(&state, &user, id, false, &headers).await
 }
 
 pub async fn download(
@@ -128,7 +135,7 @@ pub async fn download(
     Path(id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
     let user = auth::authenticate(&state, &headers).await?;
-    file_response(&state, &user, id, true).await
+    file_response(&state, &user, id, true, &headers).await
 }
 
 pub async fn artwork(
@@ -163,6 +170,7 @@ async fn file_response(
     user: &AuthUser,
     track_id: Uuid,
     download: bool,
+    headers: &HeaderMap,
 ) -> Result<Response, ApiError> {
     let visible = user.visible_library_ids();
     let track = catalog::get_track(&state.pool, track_id, &visible)
@@ -204,16 +212,146 @@ async fn file_response(
         }
         Delivery::Presigned(url) => Ok(Redirect::temporary(&url).into_response()),
         Delivery::Stream => {
-            let data = storage.read(&key).await?;
-            let mut response = data.into_response();
-
-            if download {
-                set_download_headers(&mut response, &track.file_key, &track.title)?;
-            }
-
-            Ok(response)
+            let requested = parse_range(
+                headers.get(RANGE).and_then(|value| value.to_str().ok()),
+                u64::try_from(track.size.max(0)).unwrap_or(0),
+            )?;
+            stream_range(storage, key, &track, requested, download).await
         }
     }
+}
+
+fn parse_range(header: Option<&str>, size: u64) -> Result<Option<(u64, u64)>, ApiError> {
+    let Some(header) = header else {
+        return Ok(None);
+    };
+    let Some(value) = header.strip_prefix("bytes=") else {
+        return Err(range_not_satisfiable());
+    };
+    if value.contains(',') {
+        return Err(range_not_satisfiable());
+    }
+    let Some((start, end)) = value.split_once('-') else {
+        return Err(range_not_satisfiable());
+    };
+
+    if start.is_empty() {
+        let suffix = end.parse::<u64>().map_err(|_| range_not_satisfiable())?;
+        if suffix == 0 || size == 0 {
+            return Err(range_not_satisfiable());
+        }
+        let start = size.saturating_sub(suffix);
+        return Ok(Some((start, size - 1)));
+    }
+
+    let start = start.parse::<u64>().map_err(|_| range_not_satisfiable())?;
+    if start >= size {
+        return Err(range_not_satisfiable());
+    }
+
+    let end = if end.is_empty() {
+        size - 1
+    } else {
+        end.parse::<u64>()
+            .map_err(|_| range_not_satisfiable())?
+            .min(size - 1)
+    };
+
+    if end < start {
+        return Err(range_not_satisfiable());
+    }
+
+    Ok(Some((start, end)))
+}
+
+async fn stream_range(
+    storage: std::sync::Arc<dyn mc_storage::Storage>,
+    key: Key,
+    track: &catalog::TrackDetail,
+    requested: Option<(u64, u64)>,
+    download: bool,
+) -> Result<Response, ApiError> {
+    let size = track.size.max(0) as u64;
+    let (start, end, status) = match requested {
+        Some((start, end)) => (start, end, StatusCode::PARTIAL_CONTENT),
+        None if size > 0 => (0, size - 1, StatusCode::OK),
+        None => (0, 0, StatusCode::OK),
+    };
+    let length = if size == 0 { 0 } else { end - start + 1 };
+
+    let body = if size == 0 {
+        Body::empty()
+    } else if let Some(path) = storage.local_path(&key) {
+        let mut file = tokio::fs::File::open(&path)
+            .await
+            .map_err(|error| ApiError::internal(format!("open media file: {error}")))?;
+        if start > 0 {
+            file.seek(SeekFrom::Start(start))
+                .await
+                .map_err(|error| ApiError::internal(format!("seek media file: {error}")))?;
+        }
+        Body::from_stream(ReaderStream::new(file.take(length)))
+    } else {
+        let data = storage
+            .read_range(&key, start..end + 1)
+            .await
+            .map_err(ApiError::from)?;
+        Body::from(data)
+    };
+
+    let mut response = Response::new(body);
+    *response.status_mut() = status;
+    response
+        .headers_mut()
+        .insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    response.headers_mut().insert(
+        CONTENT_LENGTH,
+        HeaderValue::from_str(&length.to_string())
+            .map_err(|_| ApiError::internal("invalid content length"))?,
+    );
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+    if let Some(content_type) = content_type(track.format.as_deref(), &track.file_key) {
+        response.headers_mut().insert(
+            CONTENT_TYPE,
+            HeaderValue::from_str(content_type)
+                .map_err(|_| ApiError::internal("invalid content type"))?,
+        );
+    }
+    if status == StatusCode::PARTIAL_CONTENT {
+        response.headers_mut().insert(
+            CONTENT_RANGE,
+            HeaderValue::from_str(&format!("bytes {start}-{end}/{size}"))
+                .map_err(|_| ApiError::internal("invalid content range"))?,
+        );
+    }
+    if download {
+        set_download_headers(&mut response, &track.file_key, &track.title)?;
+    }
+
+    Ok(response)
+}
+
+fn content_type(format: Option<&str>, file_key: &str) -> Option<&'static str> {
+    match format.map(str::to_ascii_lowercase).as_deref().or_else(|| {
+        FsPath::new(file_key)
+            .extension()
+            .and_then(|value| value.to_str())
+    }) {
+        Some("mp3" | "mpeg") => Some("audio/mpeg"),
+        Some("flac") => Some("audio/flac"),
+        Some("ogg" | "oga") => Some("audio/ogg"),
+        Some("opus") => Some("audio/opus"),
+        Some("m4a" | "mp4" | "aac") => Some("audio/mp4"),
+        Some("wav") => Some("audio/wav"),
+        Some("aiff" | "aif") => Some("audio/aiff"),
+        _ => Some("application/octet-stream"),
+    }
+}
+
+fn range_not_satisfiable() -> ApiError {
+    ApiError::new(StatusCode::RANGE_NOT_SATISFIABLE, "range not satisfiable")
 }
 
 fn set_download_headers(

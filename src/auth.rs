@@ -420,7 +420,7 @@ pub async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<AuthU
         if let Some(user) = api_tokens::find_user(&state.pool, &token_hash).await? {
             let _ = api_tokens::touch(&state.pool, &token_hash).await;
             return auth_user(
-                &state.pool,
+                state,
                 user.user_id,
                 user.username,
                 &user.role,
@@ -443,7 +443,7 @@ pub async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<AuthU
 
     let _ = sessions::touch(&state.pool, &token_hash).await;
     auth_user(
-        &state.pool,
+        state,
         user.user_id,
         user.username,
         &user.role,
@@ -467,13 +467,13 @@ pub async fn require_permission(
 }
 
 async fn auth_user(
-    pool: &mc_db::PgPool,
+    state: &AppState,
     id: Uuid,
     username: String,
     role: &str,
     subsonic_secret: String,
 ) -> Result<AuthUser, ApiError> {
-    let authz = authz::load(pool, id).await?;
+    let authz = authz::load_cached(&state.pool, &state.authz_cache, id).await?;
 
     Ok(AuthUser {
         id,

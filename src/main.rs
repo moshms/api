@@ -1,6 +1,7 @@
 mod admin;
 mod auth;
 mod authz;
+mod authz_cache;
 mod catalog;
 mod config;
 mod error;
@@ -17,9 +18,11 @@ mod transcoder;
 mod uploads;
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Context;
-use axum::extract::{DefaultBodyLimit, Request, State};
+use authz_cache::AuthzCache;
+use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
 use axum::http::header::CACHE_CONTROL;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
@@ -141,6 +144,14 @@ async fn main() -> anyhow::Result<()> {
         .filter(|url| !url.is_empty())
         .map(TranscoderClient::new);
 
+    let local_storage_roots = config
+        .local_storage_roots
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .collect::<Vec<_>>();
+
     let setup_token = if users::count(&pool).await? == 0 {
         let token = config
             .setup_token
@@ -162,11 +173,13 @@ async fn main() -> anyhow::Result<()> {
         session_ttl_hours: config.session_ttl_hours,
         setup_token,
         login_limiter: Arc::new(LoginLimiter::new()),
+        authz_cache: Arc::new(AuthzCache::new()),
         cookie_secure: config.cookie_secure,
         scan_lock: Arc::new(tokio::sync::Mutex::new(())),
         transcoder,
         metrics: metrics_handle,
         staging_path: std::path::PathBuf::from(&config.staging_path),
+        local_storage_roots,
         max_upload_bytes: config.max_upload_bytes,
         upload_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
@@ -422,16 +435,27 @@ struct Features {
 
 async fn metrics_middleware(request: Request, next: Next) -> Response {
     let method = request.method().to_string();
-    let path = request.uri().path().to_owned();
+    let path = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|matched| matched.as_str().to_owned())
+        .unwrap_or_else(|| request.uri().path().to_owned());
+    let started = Instant::now();
     let response = next.run(request).await;
 
     metrics::counter!(
         "http_requests_total",
-        "method" => method,
-        "path" => path,
+        "method" => method.clone(),
+        "path" => path.clone(),
         "status" => response.status().as_u16().to_string()
     )
     .increment(1);
+    metrics::histogram!(
+        "http_request_duration_seconds",
+        "method" => method,
+        "path" => path
+    )
+    .record(started.elapsed().as_secs_f64());
 
     response
 }

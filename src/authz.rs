@@ -65,6 +65,20 @@ impl AuthzContext {
     }
 }
 
+pub async fn load_cached(
+    pool: &PgPool,
+    cache: &crate::authz_cache::AuthzCache,
+    user_id: Uuid,
+) -> Result<AuthzContext, ApiError> {
+    if let Some(context) = cache.get(user_id) {
+        return Ok(context);
+    }
+
+    let context = load(pool, user_id).await?;
+    cache.put(user_id, context.clone());
+    Ok(context)
+}
+
 pub async fn load(pool: &PgPool, user_id: Uuid) -> Result<AuthzContext, ApiError> {
     let everyone = roles::everyone(pool)
         .await?

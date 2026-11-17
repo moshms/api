@@ -84,6 +84,7 @@ pub async fn library_set(
         deny,
     )
     .await?;
+    state.authz_cache.clear();
 
     audit::log(
         &state.pool,
@@ -113,6 +114,7 @@ pub async fn library_delete(
             "permission overwrite not found",
         ));
     }
+    state.authz_cache.clear();
 
     audit::log(
         &state.pool,
