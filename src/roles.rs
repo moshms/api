@@ -67,17 +67,20 @@ pub async fn create(
     let actor = auth::require_permission(&state, &headers, Permissions::MANAGE_ROLES).await?;
     let name = validate_name(&request.name)?;
     let permissions = validate_permissions(&actor, request.permissions)?;
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
     let role = roles::create(
-        &state.pool,
+        &mut *tx,
         name,
         request.color,
         i64::try_from(permissions.bits()).unwrap_or(i64::MAX),
     )
     .await?;
-    state.authz_cache.clear();
-
     audit::log(
-        &state.pool,
+        &mut *tx,
         Some(actor.id),
         "role.create",
         "role",
@@ -85,6 +88,10 @@ pub async fn create(
         json!({ "name": role.name, "permissions": permissions.bits() }),
     )
     .await?;
+    tx.commit()
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    state.authz_cache.clear();
 
     Ok((StatusCode::CREATED, Json(RoleDto::from(&role))))
 }
@@ -139,38 +146,62 @@ pub async fn update(
                 "the everyone role cannot be administrator",
             ));
         }
+        let mut tx = state
+            .pool
+            .begin()
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?;
         roles::update_everyone(
-            &state.pool,
+            &mut *tx,
             i64::try_from(permissions.bits()).unwrap_or(i64::MAX),
         )
         .await?;
+        audit::log(
+            &mut *tx,
+            Some(actor.id),
+            "role.update",
+            "role",
+            Some(id),
+            json!({ "permissions": permissions.bits() }),
+        )
+        .await?;
+        tx.commit()
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?;
     } else {
         let name = request.name.as_deref().map(validate_name).transpose()?;
         let name = name.unwrap_or(&current.name);
+        let mut tx = state
+            .pool
+            .begin()
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?;
         roles::update(
-            &state.pool,
+            &mut *tx,
             id,
             name,
             request.color.or(current.color),
             i64::try_from(permissions.bits()).unwrap_or(i64::MAX),
         )
         .await?;
+        audit::log(
+            &mut *tx,
+            Some(actor.id),
+            "role.update",
+            "role",
+            Some(id),
+            json!({ "name": name, "permissions": permissions.bits() }),
+        )
+        .await?;
+        tx.commit()
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?;
     }
 
     let role = roles::get(&state.pool, id)
         .await?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "role not found"))?;
     state.authz_cache.clear();
-
-    audit::log(
-        &state.pool,
-        Some(actor.id),
-        "role.update",
-        "role",
-        Some(id),
-        json!({ "name": role.name, "permissions": permissions.bits() }),
-    )
-    .await?;
 
     Ok(Json(RoleDto::from(&role)))
 }
@@ -199,13 +230,16 @@ pub async fn delete(
         ));
     }
 
-    if !roles::delete(&state.pool, id).await? {
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    if !roles::delete(&mut *tx, id).await? {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "role not found"));
     }
-    state.authz_cache.clear();
-
     audit::log(
-        &state.pool,
+        &mut *tx,
         Some(actor.id),
         "role.delete",
         "role",
@@ -213,6 +247,10 @@ pub async fn delete(
         json!({ "name": role.name }),
     )
     .await?;
+    tx.commit()
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    state.authz_cache.clear();
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -274,11 +312,14 @@ pub async fn assign(
         return Err(ApiError::new(StatusCode::NOT_FOUND, "user not found"));
     }
 
-    roles::assign(&state.pool, user_id, role_id).await?;
-    state.authz_cache.invalidate(user_id);
-
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    roles::assign(&mut *tx, user_id, role_id).await?;
     audit::log(
-        &state.pool,
+        &mut *tx,
         Some(actor.id),
         "role.assign",
         "user",
@@ -286,6 +327,10 @@ pub async fn assign(
         json!({ "role_id": role_id, "role": role.name }),
     )
     .await?;
+    tx.commit()
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    state.authz_cache.invalidate(user_id);
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -310,15 +355,19 @@ pub async fn unassign(
         ));
     }
 
-    if !roles::unassign(&state.pool, user_id, role_id).await? {
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    if !roles::unassign(&mut *tx, user_id, role_id).await? {
         return Err(ApiError::new(
             StatusCode::NOT_FOUND,
             "role assignment not found",
         ));
     }
-
     audit::log(
-        &state.pool,
+        &mut *tx,
         Some(actor.id),
         "role.unassign",
         "user",
@@ -326,6 +375,9 @@ pub async fn unassign(
         json!({ "role_id": role_id, "role": role.name }),
     )
     .await?;
+    tx.commit()
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
 
     Ok(StatusCode::NO_CONTENT)
 }
