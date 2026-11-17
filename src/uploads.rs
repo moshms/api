@@ -7,7 +7,6 @@ use axum::http::header::{CACHE_CONTROL, LOCATION};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
-use bytes::Bytes;
 use futures_util::StreamExt;
 use mc_authz::Permissions;
 use mc_core::{CoreError, Result};
@@ -18,6 +17,7 @@ use mc_scanner::ScanMode;
 use mc_storage::Key;
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
+use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 use crate::auth;
@@ -394,6 +394,22 @@ async fn complete_upload(state: &AppState, upload: &UploadRecord) -> Result<()> 
     Ok(())
 }
 
+async fn stream_staging(
+    storage: &dyn mc_storage::Storage,
+    key: &Key,
+    staging_path: &Path,
+) -> Result<()> {
+    let file = tokio::fs::File::open(staging_path)
+        .await
+        .map_err(|error| CoreError::Unavailable(format!("open staging file: {error}")))?;
+    let stream = ReaderStream::new(file).map(|result| {
+        result.map_err(|error| CoreError::Unavailable(format!("read staging file: {error}")))
+    });
+    storage.write_stream(key, Box::pin(stream)).await?;
+
+    Ok(())
+}
+
 async fn finalize(state: &AppState, upload: &UploadRecord) -> Result<Key> {
     let library = libraries::get(&state.pool, upload.library_id)
         .await?
@@ -432,18 +448,14 @@ async fn finalize(state: &AppState, upload: &UploadRecord) -> Result<Key> {
             .await
             .is_err()
         {
-            let data = tokio::fs::read(&staging_path)
-                .await
-                .map_err(|error| CoreError::Unavailable(format!("read staging file: {error}")))?;
-            storage.write(&key, Bytes::from(data)).await?;
+            let result = stream_staging(storage.as_ref(), &key, &staging_path).await;
             let _ = tokio::fs::remove_file(&staging_path).await;
+            result?;
         }
     } else {
-        let data = tokio::fs::read(&staging_path)
-            .await
-            .map_err(|error| CoreError::Unavailable(format!("read staging file: {error}")))?;
-        storage.write(&key, Bytes::from(data)).await?;
+        let result = stream_staging(storage.as_ref(), &key, &staging_path).await;
         let _ = tokio::fs::remove_file(&staging_path).await;
+        result?;
     }
 
     let scanner = state.scanner.clone();
