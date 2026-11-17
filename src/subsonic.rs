@@ -523,7 +523,9 @@ async fn stream_inner(
                 .is_none_or(|bitrate| bitrate > i32::try_from(maximum).unwrap_or(i32::MAX))
         });
 
-    if needs_transcode && storage.caps().local_path && user.can(Permissions::TRANSCODE) {
+    let key = Key::new(track.file_key.as_str())?;
+    let transcoder_local = matches!(storage.delivery(&key).await, Ok(Delivery::NginxInternal(_)));
+    if needs_transcode && transcoder_local && user.can(Permissions::TRANSCODE) {
         if let Some(transcoder) = &state.transcoder {
             let format = requested_format.unwrap_or("mp3");
             let bitrate = max_bitrate.unwrap_or(128).clamp(32, 320);
@@ -545,7 +547,6 @@ async fn stream_inner(
         }
     }
 
-    let key = Key::new(track.file_key.as_str())?;
     let suffix = file_suffix(&track.file_key);
     let content_type = content_type(&suffix);
 
