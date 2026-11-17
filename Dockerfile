@@ -32,11 +32,11 @@ RUN --mount=type=ssh --mount=type=secret,id=core_token,required=false \
     cargo build --release --target "$(cat /rust-target)" -p mc-api \
     && cp "target/$(cat /rust-target)/release/mc-api" /mc-api \
     && mkdir -p /staging \
-    && chown 65534:65534 /staging
+    && chown 65532:65532 /staging
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=builder /mc-api /mc-api
-COPY --from=builder --chown=65534:65534 /staging /staging
+COPY --from=builder --chown=65532:65532 /staging /staging
 ENV MC_HEALTHCHECK_URL=http://127.0.0.1:8080/readyz
 EXPOSE 8080
 HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=5 CMD ["/mc-api", "healthcheck"]
