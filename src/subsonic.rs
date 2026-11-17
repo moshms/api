@@ -8,7 +8,7 @@ use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::Json;
 use mc_authz::Permissions;
-use mc_core::{CoreError, Role};
+use mc_core::CoreError;
 use mc_db::repos::annotations::{self, ItemType};
 use mc_db::repos::catalog::{self, AlbumSummary, ArtistSummary, TrackDetail, TrackSummary};
 use mc_db::repos::playlists::{self, PlaylistRecord};
@@ -1024,10 +1024,6 @@ async fn authenticate(
 
     state.login_limiter.record_success(&limiter_key);
 
-    let role = user
-        .role
-        .parse::<Role>()
-        .map_err(|_| SubsonicError::internal())?;
     let authz = authz::load_cached(&state.pool, &state.authz_cache, user.id)
         .await
         .map_err(|_| SubsonicError::internal())?;
@@ -1035,7 +1031,6 @@ async fn authenticate(
     Ok(AuthUser {
         id: user.id,
         username: user.username,
-        role,
         subsonic_secret: user.subsonic_secret,
         authz,
     })

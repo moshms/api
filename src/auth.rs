@@ -21,7 +21,6 @@ use crate::state::AppState;
 pub struct AuthUser {
     pub id: Uuid,
     pub username: String,
-    pub role: Role,
     pub subsonic_secret: String,
     pub authz: AuthzContext,
 }
@@ -331,7 +330,7 @@ pub async fn me(
     Ok(Json(UserDto {
         id: user.id,
         username: user.username,
-        role: user.role,
+        role: legacy_role(&user.authz.roles),
         roles: user.authz.roles.iter().map(RoleDto::from).collect(),
         permissions: user.authz.server.bits(),
         libraries: user
@@ -527,14 +526,7 @@ pub async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<AuthU
 
         if let Some(user) = api_tokens::find_user(&state.pool, &token_hash).await? {
             let _ = api_tokens::touch(&state.pool, &token_hash).await;
-            return auth_user(
-                state,
-                user.user_id,
-                user.username,
-                &user.role,
-                user.subsonic_secret,
-            )
-            .await;
+            return auth_user(state, user.user_id, user.username, user.subsonic_secret).await;
         }
 
         return Err(authentication_required());
@@ -550,14 +542,7 @@ pub async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<AuthU
     };
 
     let _ = sessions::touch(&state.pool, &token_hash).await;
-    auth_user(
-        state,
-        user.user_id,
-        user.username,
-        &user.role,
-        user.subsonic_secret,
-    )
-    .await
+    auth_user(state, user.user_id, user.username, user.subsonic_secret).await
 }
 
 pub async fn require_permission(
@@ -578,7 +563,6 @@ async fn auth_user(
     state: &AppState,
     id: Uuid,
     username: String,
-    role: &str,
     subsonic_secret: String,
 ) -> Result<AuthUser, ApiError> {
     let authz = authz::load_cached(&state.pool, &state.authz_cache, id).await?;
@@ -586,7 +570,6 @@ async fn auth_user(
     Ok(AuthUser {
         id,
         username,
-        role: role_from_str(role)?,
         subsonic_secret,
         authz,
     })
@@ -596,7 +579,7 @@ fn user_dto(user: &users::UserRecord, authz: &AuthzContext) -> UserDto {
     UserDto {
         id: user.id,
         username: user.username.clone(),
-        role: role_from_str(&user.role).unwrap_or(Role::Listener),
+        role: legacy_role(&authz.roles),
         roles: authz.roles.iter().map(RoleDto::from).collect(),
         permissions: authz.server.bits(),
         libraries: authz
@@ -634,9 +617,9 @@ async fn create_first_admin(
     }
 
     let user = sqlx::query_as::<_, users::UserRecord>(
-        "INSERT INTO users (id, username, password_hash, subsonic_secret, role)
-         VALUES ($1, $2, $3, $4, 'admin')
-         RETURNING id, username, password_hash, subsonic_secret, role, is_active",
+        "INSERT INTO users (id, username, password_hash, subsonic_secret)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, username, password_hash, subsonic_secret, is_active",
     )
     .bind(Uuid::now_v7())
     .bind(username)
@@ -688,13 +671,17 @@ fn validate_password(password: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn role_from_str(value: &str) -> Result<Role, ApiError> {
-    value.parse().map_err(|_| {
-        ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "invalid user role in database",
-        )
-    })
+pub(crate) fn legacy_role(roles: &[RoleRecord]) -> Role {
+    if roles.iter().any(|role| role.permissions & 1 != 0) {
+        Role::Admin
+    } else if roles
+        .iter()
+        .any(|role| !role.is_everyone && role.name.eq_ignore_ascii_case("Загрузчик"))
+    {
+        Role::Uploader
+    } else {
+        Role::Listener
+    }
 }
 
 fn login_key(headers: &HeaderMap, username: &str) -> String {
