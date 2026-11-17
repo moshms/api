@@ -19,11 +19,13 @@ pub struct AppState {
     pub session_ttl_hours: i64,
     pub setup_token: Option<String>,
     pub login_limiter: Arc<crate::rate_limit::LoginLimiter>,
+    pub authz_cache: Arc<crate::authz_cache::AuthzCache>,
     pub cookie_secure: bool,
     pub scan_lock: Arc<tokio::sync::Mutex<()>>,
     pub transcoder: Option<TranscoderClient>,
     pub metrics: Option<mc_telemetry::PrometheusHandle>,
     pub staging_path: PathBuf,
+    pub local_storage_roots: Vec<PathBuf>,
     pub max_upload_bytes: u64,
     pub upload_locks: Arc<Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>>,
 }

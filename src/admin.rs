@@ -114,6 +114,28 @@ pub async fn create_storage(
         ));
     }
 
+    if request.kind == "local" {
+        let root = request
+            .config
+            .get("root")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "local storage requires root"))?;
+        let canonical = tokio::fs::canonicalize(root).await.map_err(|_| {
+            ApiError::new(StatusCode::BAD_REQUEST, "local storage root is unavailable")
+        })?;
+        let allowed = state.local_storage_roots.iter().any(|base| {
+            base.canonicalize()
+                .map(|base| canonical.starts_with(base))
+                .unwrap_or(false)
+        });
+        if !allowed {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "local storage root is outside MC_LOCAL_STORAGE_ROOTS",
+            ));
+        }
+    }
+
     let config = encode_storage_config(&request.kind, &request.config, state.master_key.as_ref())?;
 
     let candidate = StorageRecord {
@@ -198,6 +220,7 @@ pub async fn create_library(
 
     apply_library_access(&state, library.id, request.access.as_ref()).await?;
     reload_registry(&state).await?;
+    state.authz_cache.clear();
 
     audit::log(
         &state.pool,
@@ -224,6 +247,7 @@ pub async fn delete_library(
     }
 
     reload_registry(&state).await?;
+    state.authz_cache.clear();
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -312,6 +336,7 @@ pub async fn create_user(
     )
     .await?;
     sync_legacy_role(&state.pool, user.id, role.as_str(), actor.is_admin()).await?;
+    state.authz_cache.invalidate(user.id);
 
     audit::log(
         &state.pool,
@@ -390,6 +415,7 @@ pub async fn update_user(
         let password_hash = mc_auth::hash_password(password)?;
         users::update_password(&state.pool, id, &password_hash).await?;
     }
+    state.authz_cache.invalidate(id);
 
     let user = users::get(&state.pool, id)
         .await?
@@ -451,6 +477,7 @@ pub async fn delete_user(
     }
 
     if users::delete(&state.pool, id).await? {
+        state.authz_cache.invalidate(id);
         audit::log(
             &state.pool,
             Some(current.id),

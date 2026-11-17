@@ -74,6 +74,7 @@ pub async fn create(
         i64::try_from(permissions.bits()).unwrap_or(i64::MAX),
     )
     .await?;
+    state.authz_cache.clear();
 
     audit::log(
         &state.pool,
@@ -159,6 +160,7 @@ pub async fn update(
     let role = roles::get(&state.pool, id)
         .await?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "role not found"))?;
+    state.authz_cache.clear();
 
     audit::log(
         &state.pool,
@@ -200,6 +202,7 @@ pub async fn delete(
     if !roles::delete(&state.pool, id).await? {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "role not found"));
     }
+    state.authz_cache.clear();
 
     audit::log(
         &state.pool,
@@ -228,6 +231,7 @@ pub async fn reorder(
     }
 
     roles::reorder(&state.pool, &request.ids).await?;
+    state.authz_cache.clear();
 
     audit::log(
         &state.pool,
@@ -271,6 +275,7 @@ pub async fn assign(
     }
 
     roles::assign(&state.pool, user_id, role_id).await?;
+    state.authz_cache.invalidate(user_id);
 
     audit::log(
         &state.pool,

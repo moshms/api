@@ -19,6 +19,7 @@ pub struct Config {
     pub library_path: String,
     pub library_name: String,
     pub library_access: String,
+    pub local_storage_roots: String,
     pub scan_on_start: bool,
     pub transcoder_url: Option<String>,
     pub master_key: Option<String>,
@@ -43,6 +44,7 @@ impl Default for Config {
             library_path: "/library".to_owned(),
             library_name: "Music".to_owned(),
             library_access: "closed".to_owned(),
+            local_storage_roots: "/library".to_owned(),
             scan_on_start: false,
             transcoder_url: None,
             master_key: None,
@@ -85,6 +87,7 @@ mod tests {
         assert_eq!(config.library_path, "/library");
         assert_eq!(config.library_name, "Music");
         assert_eq!(config.library_access, "closed");
+        assert_eq!(config.local_storage_roots, "/library");
         assert_eq!(config.session_ttl_hours, 720);
         assert!(!config.cookie_secure);
     }

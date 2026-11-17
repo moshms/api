@@ -452,12 +452,10 @@ async fn finalize(state: &AppState, upload: &UploadRecord) -> Result<Key> {
     let pool = state.pool.clone();
     let library_id = library.id;
     let key_string = key.as_str().to_owned();
+    let scan_mode = ScanMode::Paths(vec![key.clone()]);
     let user_id = upload.user_id;
     tokio::spawn(async move {
-        match scanner
-            .scan_library(&library, storage, ScanMode::Full)
-            .await
-        {
+        match scanner.scan_library(&library, storage, scan_mode).await {
             Ok(stats) => {
                 if let Err(error) =
                     media_files::set_uploaded_by(&pool, library_id, &key_string, user_id).await
