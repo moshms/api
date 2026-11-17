@@ -327,14 +327,7 @@ pub async fn create_user(
     }
     let password_hash = mc_auth::hash_password(&request.password)?;
     let subsonic_secret = mc_auth::generate_secret();
-    let user = users::create(
-        &state.pool,
-        username,
-        &password_hash,
-        &subsonic_secret,
-        role.as_str(),
-    )
-    .await?;
+    let user = users::create(&state.pool, username, &password_hash, &subsonic_secret).await?;
     sync_legacy_role(&state.pool, user.id, role.as_str(), actor.is_admin()).await?;
     state.authz_cache.invalidate(user.id);
 
@@ -351,7 +344,6 @@ pub async fn create_user(
     let summary = UserSummary {
         id: user.id,
         username: user.username,
-        role: user.role,
         is_active: user.is_active,
     };
 
@@ -387,12 +379,13 @@ pub async fn update_user(
             "only administrators can grant the administrator role",
         ));
     }
-    let new_role = role.map_or_else(|| current.role.clone(), |role| role.as_str().to_owned());
     let new_active = request.is_active.unwrap_or(current.is_active);
+    let currently_admin = roles::has_admin_role(&state.pool, id).await?;
+    let new_admin = role.map_or(currently_admin, Role::is_admin);
 
     if current.is_active
-        && (new_role.as_str() != "admin" || !new_active)
-        && roles::has_admin_role(&state.pool, id).await?
+        && (!new_admin || !new_active)
+        && currently_admin
         && roles::count_active_admins(&state.pool).await? <= 1
     {
         return Err(ApiError::new(
@@ -401,9 +394,8 @@ pub async fn update_user(
         ));
     }
 
-    if role.is_some() {
-        users::update_role(&state.pool, id, &new_role).await?;
-        sync_legacy_role(&state.pool, id, &new_role, actor.is_admin()).await?;
+    if let Some(role) = role {
+        sync_legacy_role(&state.pool, id, role.as_str(), actor.is_admin()).await?;
     }
 
     if request.is_active.is_some() {
@@ -427,14 +419,13 @@ pub async fn update_user(
         "user.update",
         "user",
         Some(id),
-        json!({ "role": user.role, "is_active": user.is_active }),
+        json!({ "is_active": user.is_active }),
     )
     .await?;
 
     let summary = UserSummary {
         id: user.id,
         username: user.username,
-        role: user.role,
         is_active: user.is_active,
     };
 
@@ -502,7 +493,7 @@ async fn admin_user_dto(
     Ok(AdminUserDto {
         id: user.id,
         username: user.username.clone(),
-        role: user.role.clone(),
+        role: auth::legacy_role(&roles).as_str().to_owned(),
         is_active: user.is_active,
         roles: roles.iter().map(RoleDto::from).collect(),
     })
