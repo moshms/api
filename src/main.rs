@@ -254,6 +254,13 @@ fn api_router(state: AppState) -> Router {
             get(auth::list_tokens).post(auth::create_token),
         )
         .route("/api/v1/auth/tokens/{id}", delete(auth::delete_token))
+        .route("/api/v1/auth/password", post(auth::change_password))
+        .route(
+            "/api/v1/auth/sessions",
+            get(auth::list_sessions).delete(auth::delete_other_sessions),
+        )
+        .route("/api/v1/auth/sessions/{id}", delete(auth::delete_session))
+        .route("/api/v1/auth/subsonic/rotate", post(auth::rotate_subsonic))
         .layer(SetResponseHeaderLayer::overriding(
             CACHE_CONTROL,
             HeaderValue::from_static("no-store"),
@@ -273,6 +280,7 @@ fn api_router(state: AppState) -> Router {
                 .delete(uploads::delete),
         )
         .route("/api/v1/artists", get(catalog::artists))
+        .route("/api/v1/artists/{id}/tracks", get(catalog::artist_tracks))
         .route("/api/v1/albums", get(catalog::albums))
         .route("/api/v1/albums/{id}", get(catalog::album))
         .route("/api/v1/tracks/{id}", get(catalog::track))

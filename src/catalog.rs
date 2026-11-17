@@ -34,6 +34,12 @@ pub struct SearchQuery {
     pub q: String,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct ArtistTracksQuery {
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
 pub async fn libraries(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -67,6 +73,21 @@ pub async fn albums(
     let visible = user.visible_library_ids();
     Ok(Json(
         catalog::list_albums(&state.pool, query.artist_id, &visible).await?,
+    ))
+}
+
+pub async fn artist_tracks(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Query(query): Query<ArtistTracksQuery>,
+) -> Result<Json<Vec<catalog::TrackSummary>>, ApiError> {
+    let user = auth::authenticate(&state, &headers).await?;
+    let visible = user.visible_library_ids();
+    let limit = query.limit.unwrap_or(100).clamp(1, 500);
+
+    Ok(Json(
+        catalog::list_artist_tracks(&state.pool, id, &visible, limit).await?,
     ))
 }
 

@@ -129,6 +129,22 @@ pub struct SubsonicCredentials {
     pub password: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct SessionDto {
+    pub id: Uuid,
+    pub client_name: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub last_seen_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+    pub current: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PasswordChangeRequest {
+    pub current_password: String,
+    pub new_password: String,
+}
+
 pub async fn ensure_admin(pool: &mc_db::PgPool, config: &Config) -> anyhow::Result<()> {
     if users::count(pool).await? > 0 {
         return Ok(());
@@ -331,6 +347,98 @@ pub async fn me(
                 permissions: library.permissions.bits(),
             })
             .collect(),
+    }))
+}
+
+pub async fn change_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<PasswordChangeRequest>,
+) -> Result<StatusCode, ApiError> {
+    let auth_user = authenticate(&state, &headers).await?;
+    let user = users::get(&state.pool, auth_user.id)
+        .await?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "user not found"))?;
+
+    if !mc_auth::verify_password(&user.password_hash, &request.current_password)? {
+        return Err(invalid_credentials());
+    }
+
+    validate_password(&request.new_password)?;
+    let password_hash = mc_auth::hash_password(&request.new_password)?;
+    let subsonic_secret = mc_auth::generate_secret();
+
+    users::update_password(&state.pool, user.id, &password_hash).await?;
+    users::update_subsonic_secret(&state.pool, user.id, &subsonic_secret).await?;
+    sessions::delete_for_user(&state.pool, user.id).await?;
+    api_tokens::delete_for_user(&state.pool, user.id).await?;
+    state.authz_cache.invalidate(user.id);
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn list_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<SessionDto>>, ApiError> {
+    let user = authenticate(&state, &headers).await?;
+    let current_hash = session_token(&headers).map(mc_auth::hash_token);
+    let records = sessions::list_for_user(&state.pool, user.id).await?;
+    let sessions = records
+        .into_iter()
+        .map(|record| SessionDto {
+            id: record.id,
+            client_name: record.client_name,
+            created_at: record.created_at,
+            last_seen_at: record.last_seen_at,
+            expires_at: record.expires_at,
+            current: current_hash.as_deref() == Some(record.token_hash.as_str()),
+        })
+        .collect();
+
+    Ok(Json(sessions))
+}
+
+pub async fn delete_other_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let user = authenticate(&state, &headers).await?;
+    let current_hash = session_token(&headers).map(mc_auth::hash_token);
+
+    if let Some(hash) = current_hash {
+        sessions::delete_others(&state.pool, user.id, &hash).await?;
+    } else {
+        sessions::delete_for_user(&state.pool, user.id).await?;
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn delete_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    let user = authenticate(&state, &headers).await?;
+    if sessions::delete_by_id(&state.pool, user.id, id).await? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::new(StatusCode::NOT_FOUND, "session not found"))
+    }
+}
+
+pub async fn rotate_subsonic(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<SubsonicCredentials>, ApiError> {
+    let user = authenticate(&state, &headers).await?;
+    let secret = mc_auth::generate_secret();
+    users::update_subsonic_secret(&state.pool, user.id, &secret).await?;
+
+    Ok(Json(SubsonicCredentials {
+        username: user.username,
+        password: secret,
     }))
 }
 
@@ -612,7 +720,7 @@ fn authentication_required() -> ApiError {
     ApiError::new(StatusCode::UNAUTHORIZED, "authentication required")
 }
 
-fn session_token(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn session_token(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(COOKIE)
         .and_then(|value| value.to_str().ok())

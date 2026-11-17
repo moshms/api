@@ -11,6 +11,7 @@ anyhow = "1"
 axum = "0.8"
 base64 = "0.23"
 bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
 figment = { version = "0.10", features = ["env"] }
 form_urlencoded = "1"
 futures-util = "0.3"
@@ -30,15 +31,15 @@ tower-http = { version = "0.6", features = ["trace", "timeout", "set-header"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v7", "serde"] }
 
-mc-auth = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.2.1" }
-mc-authz = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.2.1" }
-mc-core = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.2.1" }
-mc-crypto = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.2.1" }
-mc-db = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.2.1" }
-mc-jobs = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.2.1" }
-mc-media = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.2.1" }
-mc-proto = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.2.1" }
-mc-runtime = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.2.1" }
-mc-scanner = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.2.1" }
-mc-storage = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.2.1" }
-mc-telemetry = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.2.1", features = ["metrics"] }
+mc-auth = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.2.3" }
+mc-authz = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.2.3" }
+mc-core = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.2.3" }
+mc-crypto = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.2.3" }
+mc-db = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.2.3" }
+mc-jobs = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.2.3" }
+mc-media = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.2.3" }
+mc-proto = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.2.3" }
+mc-runtime = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.2.3" }
+mc-scanner = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.2.3" }
+mc-storage = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.2.3" }
+mc-telemetry = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.2.3", features = ["metrics"] }
