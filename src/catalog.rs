@@ -415,7 +415,9 @@ pub(crate) fn content_disposition(file_key: &str, title: &str) -> String {
         .map(|value| format!(".{value}"))
         .unwrap_or_default();
     let utf8 = format!("{title}{extension}");
-    let encoded = form_urlencoded::byte_serialize(utf8.as_bytes()).collect::<String>();
+    let encoded = form_urlencoded::byte_serialize(utf8.as_bytes())
+        .collect::<String>()
+        .replace('+', "%20");
 
     format!("attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}")
 }
