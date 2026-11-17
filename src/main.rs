@@ -317,6 +317,7 @@ fn api_router(state: AppState) -> Router {
             put(favorites::star_artist).delete(favorites::unstar_artist),
         )
         .route("/api/v1/admin/scan", post(scan))
+        .route("/api/v1/admin/scan/async", post(scan_async))
         .route(
             "/api/v1/admin/storages",
             get(admin::list_storages).post(admin::create_storage),
@@ -494,6 +495,28 @@ async fn features(
         tag_editor: worker,
         monitoring: state.metrics.is_some(),
     }))
+}
+
+#[derive(Debug, Serialize)]
+struct ScanQueued {
+    job_id: Uuid,
+}
+
+async fn scan_async(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<ScanQueued>), ApiError> {
+    auth::require_permission(&state, &headers, mc_authz::Permissions::RUN_SCANS).await?;
+
+    if !mc_jobs::is_worker_online(&state.pool, 30).await? {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "worker is offline",
+        ));
+    }
+
+    let job_id = mc_jobs::enqueue(&state.pool, "scan", serde_json::json!({})).await?;
+    Ok((StatusCode::ACCEPTED, Json(ScanQueued { job_id })))
 }
 
 async fn scan(State(state): State<AppState>, headers: HeaderMap) -> Response {
