@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use crate::auth::AuthUser;
 use crate::authz;
-use crate::catalog::download_filename;
+use crate::catalog::content_disposition;
 use crate::state::AppState;
 
 const API_VERSION: &str = "1.16.1";
@@ -568,10 +568,9 @@ async fn stream_inner(
     );
 
     if download {
-        let filename = download_filename(&track.file_key, &track.title);
         response.headers_mut().insert(
             CONTENT_DISPOSITION,
-            HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+            HeaderValue::from_str(&content_disposition(&track.file_key, &track.title))
                 .map_err(|_| SubsonicError::internal())?,
         );
     }
@@ -1363,10 +1362,9 @@ fn transcoded_response(
         .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
 
     if download {
-        let filename = download_filename(file_key, title);
         response.headers_mut().insert(
             CONTENT_DISPOSITION,
-            HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+            HeaderValue::from_str(&content_disposition(file_key, title))
                 .map_err(|_| SubsonicError::internal())?,
         );
     }

@@ -78,6 +78,15 @@ pub async fn create(
         }
     };
 
+    if let Some(year) = request.changes.year {
+        if !(1000..=2100).contains(&year) {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "year must be between 1000 and 2100",
+            ));
+        }
+    }
+
     if request.changes.is_empty() && artwork.is_none() {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,

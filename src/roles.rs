@@ -418,6 +418,12 @@ fn validate_permissions(actor: &AuthUser, value: u64) -> Result<Permissions, Api
     }
 
     if !actor.is_admin() {
+        if permissions.intersects(Permissions::LIBRARY_BITS) {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "library permissions can only be granted through library overwrites",
+            ));
+        }
         let allowed = actor
             .authz
             .libraries
