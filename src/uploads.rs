@@ -25,6 +25,8 @@ use crate::error::ApiError;
 use crate::state::AppState;
 
 const TUS_VERSION: &str = "1.0.0";
+const UPLOAD_TTL_HOURS: i64 = 24;
+const MAX_ACTIVE_UPLOADS: i64 = 20;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateUploadQuery {
@@ -33,14 +35,14 @@ pub struct CreateUploadQuery {
 
 pub async fn options(State(state): State<AppState>) -> Response {
     let mut response = StatusCode::NO_CONTENT.into_response();
-    insert_tus_headers(&mut response, None, None);
+    insert_tus_headers(&mut response, None, None, None);
     response.headers_mut().insert(
         HeaderName::from_static("tus-version"),
         HeaderValue::from_static(TUS_VERSION),
     );
     response.headers_mut().insert(
         HeaderName::from_static("tus-extension"),
-        HeaderValue::from_static("creation,termination"),
+        HeaderValue::from_static("creation,termination,expiration"),
     );
     response.headers_mut().insert(
         HeaderName::from_static("tus-max-size"),
@@ -74,6 +76,13 @@ pub async fn create(
         return Err(ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
             "upload is too large",
+        ));
+    }
+
+    if uploads::count_active_for_user(&state.pool, user.id).await? >= MAX_ACTIVE_UPLOADS {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many active uploads",
         ));
     }
 
@@ -141,7 +150,12 @@ pub async fn create(
         HeaderValue::from_str(&format!("/tus/{}", upload.id))
             .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "invalid location"))?,
     );
-    insert_tus_headers(&mut response, Some(0), Some(size));
+    insert_tus_headers(
+        &mut response,
+        Some(0),
+        Some(size),
+        Some(&upload_expires(&upload.updated_at)),
+    );
 
     Ok(response)
 }
@@ -160,6 +174,7 @@ pub async fn head(
         &mut response,
         Some(upload.offset.max(0) as u64),
         Some(upload.size.max(0) as u64),
+        Some(&upload_expires(&upload.updated_at)),
     );
     response
         .headers_mut()
@@ -199,7 +214,7 @@ pub async fn patch(
 
     if upload.status == "complete" {
         let mut response = StatusCode::NO_CONTENT.into_response();
-        insert_tus_headers(&mut response, Some(size), Some(size));
+        insert_tus_headers(&mut response, Some(size), Some(size), None);
         return Ok(response);
     }
 
@@ -211,7 +226,7 @@ pub async fn patch(
         }
 
         let mut response = StatusCode::NO_CONTENT.into_response();
-        insert_tus_headers(&mut response, Some(size), Some(size));
+        insert_tus_headers(&mut response, Some(size), Some(size), None);
         return Ok(response);
     }
 
@@ -287,7 +302,7 @@ pub async fn patch(
     }
 
     let mut response = StatusCode::NO_CONTENT.into_response();
-    insert_tus_headers(&mut response, Some(new_offset), Some(size));
+    insert_tus_headers(&mut response, Some(new_offset), Some(size), None);
 
     Ok(response)
 }
@@ -537,7 +552,18 @@ async fn finalize(state: &AppState, upload: &UploadRecord) -> Result<Key> {
     Ok(key)
 }
 
-fn insert_tus_headers(response: &mut Response, offset: Option<u64>, length: Option<u64>) {
+fn upload_expires(updated_at: &chrono::DateTime<chrono::Utc>) -> String {
+    (*updated_at + chrono::Duration::hours(UPLOAD_TTL_HOURS))
+        .format("%a, %d %b %Y %H:%M:%S GMT")
+        .to_string()
+}
+
+fn insert_tus_headers(
+    response: &mut Response,
+    offset: Option<u64>,
+    length: Option<u64>,
+    expires: Option<&str>,
+) {
     response.headers_mut().insert(
         HeaderName::from_static("tus-resumable"),
         HeaderValue::from_static(TUS_VERSION),
@@ -558,6 +584,28 @@ fn insert_tus_headers(response: &mut Response, offset: Option<u64>, length: Opti
                 .insert(HeaderName::from_static("upload-length"), value);
         }
     }
+
+    if let Some(expires) = expires {
+        if let Ok(value) = HeaderValue::from_str(expires) {
+            response
+                .headers_mut()
+                .insert(HeaderName::from_static("upload-expires"), value);
+        }
+    }
+}
+
+pub async fn cleanup_stale(state: &AppState) -> Result<()> {
+    let stale = uploads::stale(&state.pool, UPLOAD_TTL_HOURS).await?;
+    for upload in &stale {
+        let path = state.staging_path.join(&upload.staging_key);
+        let _ = tokio::fs::remove_file(&path).await;
+        let _ = uploads::delete(&state.pool, upload.id).await;
+    }
+    if !stale.is_empty() {
+        tracing::info!(count = stale.len(), "removed stale uploads");
+    }
+
+    Ok(())
 }
 
 fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {

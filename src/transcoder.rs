@@ -14,6 +14,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_millis(750);
 pub struct TranscoderClient {
     endpoint: String,
     availability: Arc<Mutex<Option<(Instant, bool)>>>,
+    channel: Arc<tokio::sync::Mutex<Option<Channel>>>,
 }
 
 impl TranscoderClient {
@@ -21,6 +22,7 @@ impl TranscoderClient {
         Self {
             endpoint: endpoint.into(),
             availability: Arc::new(Mutex::new(None)),
+            channel: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -49,7 +51,7 @@ impl TranscoderClient {
         format: &str,
         bitrate_kbps: u32,
     ) -> Result<Streaming<TranscodeChunk>> {
-        let channel = self.connect().await?;
+        let channel = self.channel().await?;
         let mut client = GrpcTranscoderClient::new(channel);
         let response = client
             .transcode(TranscodeRequest {
@@ -59,14 +61,20 @@ impl TranscoderClient {
                 source_path: source_path.unwrap_or_default().to_owned(),
                 cleanup_source: source_path.is_some(),
             })
-            .await
-            .map_err(|status| CoreError::Unavailable(format!("transcoder: {status}")))?;
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(status) => {
+                self.reset().await;
+                return Err(CoreError::Unavailable(format!("transcoder: {status}")));
+            }
+        };
 
         Ok(response.into_inner())
     }
 
     async fn check_health(&self) -> bool {
-        let Ok(channel) = self.connect().await else {
+        let Ok(channel) = self.channel().await else {
             return false;
         };
 
@@ -77,11 +85,33 @@ impl TranscoderClient {
 
         match tokio::time::timeout(CONNECT_TIMEOUT, client.check(request)).await {
             Ok(Ok(response)) => {
-                response.into_inner().status
-                    == tonic_health::pb::health_check_response::ServingStatus::Serving as i32
+                let serving = response.into_inner().status
+                    == tonic_health::pb::health_check_response::ServingStatus::Serving as i32;
+                if !serving {
+                    self.reset().await;
+                }
+                serving
             }
-            _ => false,
+            _ => {
+                self.reset().await;
+                false
+            }
         }
+    }
+
+    async fn channel(&self) -> Result<Channel> {
+        let mut cached = self.channel.lock().await;
+        if let Some(channel) = cached.as_ref() {
+            return Ok(channel.clone());
+        }
+
+        let channel = self.connect().await?;
+        *cached = Some(channel.clone());
+        Ok(channel)
+    }
+
+    async fn reset(&self) {
+        *self.channel.lock().await = None;
     }
 
     async fn connect(&self) -> Result<Channel> {

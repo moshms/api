@@ -18,6 +18,7 @@ mod transcoder;
 mod uploads;
 
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::Context;
@@ -200,6 +201,18 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+
+    let cleanup_state = state.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(3600));
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            if let Err(error) = crate::uploads::cleanup_stale(&cleanup_state).await {
+                tracing::warn!(%error, "failed to clean stale uploads");
+            }
+        }
+    });
 
     let health = health_router(pool);
     let api = api_router(state);
