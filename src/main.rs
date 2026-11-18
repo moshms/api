@@ -297,6 +297,7 @@ fn api_router(state: AppState) -> Router {
         .route("/api/v1/artists/{id}/tracks", get(catalog::artist_tracks))
         .route("/api/v1/albums", get(catalog::albums))
         .route("/api/v1/albums/{id}", get(catalog::album))
+        .route("/api/v1/albums/{id}/download", get(catalog::album_zip))
         .route("/api/v1/tracks", get(catalog::tracks))
         .route("/api/v1/genres", get(catalog::genres))
         .route("/api/v1/tracks/{id}", get(catalog::track))

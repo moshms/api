@@ -53,6 +53,12 @@ pub struct TracksQuery {
     #[serde(default)]
     pub genre_id: Option<Uuid>,
     #[serde(default)]
+    pub missing_artwork: bool,
+    #[serde(default)]
+    pub missing_year: bool,
+    #[serde(default)]
+    pub mine: bool,
+    #[serde(default)]
     pub limit: Option<i64>,
     #[serde(default)]
     pub offset: Option<i64>,
@@ -158,17 +164,15 @@ pub async fn tracks(
     let visible = user.visible_library_ids();
     let limit = query.limit.map(|value| value.clamp(1, 500));
     let offset = query.offset.unwrap_or(0).max(0);
-    let total =
-        catalog::count_tracks(&state.pool, &visible, query.library_id, query.genre_id).await?;
-    let tracks = catalog::list_tracks_page(
-        &state.pool,
-        &visible,
-        query.library_id,
-        query.genre_id,
-        limit,
-        offset,
-    )
-    .await?;
+    let filters = catalog::TrackFilters {
+        library_id: query.library_id,
+        genre_id: query.genre_id,
+        missing_artwork: query.missing_artwork,
+        missing_year: query.missing_year,
+        uploaded_by: query.mine.then_some(user.id),
+    };
+    let total = catalog::count_tracks(&state.pool, &visible, filters).await?;
+    let tracks = catalog::list_tracks_page(&state.pool, &visible, filters, limit, offset).await?;
 
     Ok(paginated(tracks, total, limit, offset))
 }
@@ -227,6 +231,138 @@ fn paginated<T: serde::Serialize>(
     }
 
     response
+}
+
+pub async fn album_zip(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Response, ApiError> {
+    let user = auth::authenticate(&state, &headers).await?;
+    let visible = user.visible_library_ids();
+    let album = catalog::get_album(&state.pool, id, &visible)
+        .await?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "album not found"))?;
+    if album.tracks.is_empty() {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "album has no tracks"));
+    }
+    if !album
+        .tracks
+        .iter()
+        .all(|track| user.can_library(track.library_id, Permissions::LIBRARY_DOWNLOAD))
+    {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "permission denied"));
+    }
+
+    let registry = state.registry.read().await.clone();
+    let mut entries = Vec::with_capacity(album.tracks.len());
+    for track in &album.tracks {
+        let storage = registry
+            .storage_for_library(track.library_id)
+            .ok_or_else(|| {
+                ApiError::new(StatusCode::NOT_FOUND, "library storage is unavailable")
+            })?;
+        entries.push((track.title.clone(), track.file_key.clone(), storage));
+    }
+
+    let directory = state.staging_path.join("zips");
+    tokio::fs::create_dir_all(&directory)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ =
+            tokio::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o777)).await;
+    }
+    let path = directory.join(format!("{}-{}.zip", album.album.id, Uuid::now_v7()));
+    let zip_path = path.clone();
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        use std::io::Write;
+
+        let file = std::fs::File::create(&zip_path).map_err(|error| error.to_string())?;
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (index, (title, file_key, storage)) in entries.into_iter().enumerate() {
+            let key = Key::new(file_key.as_str()).map_err(|error| error.to_string())?;
+            let bytes = handle
+                .block_on(storage.read(&key))
+                .map_err(|error| error.to_string())?;
+            let extension = FsPath::new(&file_key)
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("bin");
+            let name = format!(
+                "{:02} {}.{}",
+                index + 1,
+                sanitize_zip_name(&title),
+                extension
+            );
+            zip.start_file(name, options)
+                .map_err(|error| error.to_string())?;
+            zip.write_all(&bytes).map_err(|error| error.to_string())?;
+        }
+        zip.finish().map_err(|error| error.to_string())?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))?
+    .map_err(ApiError::internal)?;
+
+    let metadata = tokio::fs::metadata(&path)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let cleanup = path.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        let _ = tokio::fs::remove_file(cleanup).await;
+    });
+
+    let mut response = Response::new(Body::from_stream(ReaderStream::new(file)));
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/zip"));
+    response.headers_mut().insert(
+        CONTENT_LENGTH,
+        HeaderValue::from_str(&metadata.len().to_string())
+            .map_err(|_| ApiError::internal("invalid zip length"))?,
+    );
+    response.headers_mut().insert(
+        CONTENT_DISPOSITION,
+        HeaderValue::from_str(&content_disposition(
+            "album.zip",
+            &format!("{} - {}", album.album.album_artist, album.album.title),
+        ))
+        .map_err(|_| ApiError::internal("invalid zip filename"))?,
+    );
+
+    Ok(response)
+}
+
+fn sanitize_zip_name(value: &str) -> String {
+    let cleaned = value
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() || matches!(character, ' ' | '-' | '_' | '.' | '(' | ')')
+            {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim()
+        .to_owned();
+    if cleaned.is_empty() {
+        "track".to_owned()
+    } else {
+        cleaned
+    }
 }
 
 pub async fn album(
