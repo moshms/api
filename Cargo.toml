@@ -16,6 +16,7 @@ figment = { version = "0.10", features = ["env"] }
 form_urlencoded = "1"
 futures-util = "0.3"
 hex = "0.4"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 metrics = "0.24"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }

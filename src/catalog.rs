@@ -65,6 +65,12 @@ pub struct GenresQuery {
 }
 
 #[derive(Debug, Default, Deserialize)]
+pub struct ArtworkQuery {
+    #[serde(default)]
+    pub size: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 pub struct SearchQuery {
     #[serde(default)]
     pub q: String,
@@ -295,6 +301,7 @@ pub async fn artwork(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(album_id): Path<Uuid>,
+    Query(query): Query<ArtworkQuery>,
 ) -> Result<Response, ApiError> {
     let user = auth::authenticate(&state, &headers).await?;
     let visible = user.visible_library_ids();
@@ -302,7 +309,37 @@ pub async fn artwork(
     let artwork = catalog::get_album_artwork(&state.pool, album_id, &visible)
         .await?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "artwork not found"))?;
-    let etag = format!("\"{}\"", artwork.etag);
+    let size = query.size.filter(|size| matches!(size, 96 | 300 | 600));
+    let (mime, data, etag) = if let Some(size) = size {
+        let cache_key = (album_id, size);
+        let cached = state
+            .artwork_cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&cache_key).cloned());
+        if let Some((mime, data)) = cached {
+            (mime, data, format!("\"{}-{size}\"", artwork.etag))
+        } else {
+            let source = image::load_from_memory(&artwork.data)
+                .map_err(|_| ApiError::internal("invalid artwork image"))?;
+            let resized = source.thumbnail(size, size);
+            let mut cursor = std::io::Cursor::new(Vec::new());
+            resized
+                .write_to(&mut cursor, image::ImageFormat::WebP)
+                .map_err(|_| ApiError::internal("encode artwork preview"))?;
+            let data = cursor.into_inner();
+            let mime = "image/webp".to_owned();
+            if let Ok(mut cache) = state.artwork_cache.lock() {
+                if cache.len() > 256 {
+                    cache.clear();
+                }
+                cache.insert(cache_key, (mime.clone(), data.clone()));
+            }
+            (mime, data, format!("\"{}-{size}\"", artwork.etag))
+        }
+    } else {
+        (artwork.mime, artwork.data, format!("\"{}\"", artwork.etag))
+    };
 
     if headers
         .get(IF_NONE_MATCH)
@@ -317,10 +354,10 @@ pub async fn artwork(
         return Ok(response);
     }
 
-    let mut response = artwork.data.into_response();
+    let mut response = data.into_response();
     response.headers_mut().insert(
         CONTENT_TYPE,
-        HeaderValue::from_str(&artwork.mime).map_err(|_| {
+        HeaderValue::from_str(&mime).map_err(|_| {
             ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "invalid artwork type")
         })?,
     );

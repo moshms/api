@@ -10,6 +10,8 @@ use uuid::Uuid;
 use crate::transcoder::TranscoderClient;
 use mc_runtime::StorageRegistry;
 
+pub type ArtworkCache = Arc<Mutex<HashMap<(Uuid, u32), (String, Vec<u8>)>>>;
+
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
@@ -28,4 +30,5 @@ pub struct AppState {
     pub local_storage_roots: Vec<PathBuf>,
     pub max_upload_bytes: u64,
     pub upload_locks: Arc<Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>>,
+    pub artwork_cache: ArtworkCache,
 }

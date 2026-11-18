@@ -183,6 +183,7 @@ async fn main() -> anyhow::Result<()> {
         local_storage_roots,
         max_upload_bytes: config.max_upload_bytes,
         upload_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        artwork_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
     if config.scan_on_start {
