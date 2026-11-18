@@ -175,6 +175,68 @@ def main():
     )
     expect(status == 429, "login rate limit did not trigger")
 
+
+    status, listener_user = call(
+        admin,
+        "POST",
+        "/api/v1/admin/users",
+        {"username": "listener", "password": "listener12345", "role": "listener"},
+    )
+    expect(status == 201, f"create listener failed: {status} {listener_user}")
+    listener = client()
+    status, _ = call(
+        listener,
+        "POST",
+        "/api/v1/auth/login",
+        {"username": "listener", "password": "listener12345"},
+    )
+    expect(status == 200, "listener login failed")
+
+    status, uploader_user = call(
+        admin,
+        "POST",
+        "/api/v1/admin/users",
+        {"username": "uploader", "password": "uploader12345", "role": "uploader"},
+    )
+    expect(status == 201, f"create uploader failed: {status} {uploader_user}")
+    uploader = client()
+    status, _ = call(
+        uploader,
+        "POST",
+        "/api/v1/auth/login",
+        {"username": "uploader", "password": "uploader12345"},
+    )
+    expect(status == 200, "uploader login failed")
+
+    matrix = [
+        (listener, "GET", "/api/v1/admin/users", None, 403),
+        (listener, "GET", "/api/v1/roles", None, 403),
+        (listener, "POST", "/api/v1/admin/scan", None, 403),
+        (listener, "GET", "/api/v1/audit-log", None, 403),
+        (listener, "GET", "/api/v1/libraries", None, 200),
+        (listener, "GET", "/api/v1/albums", None, 200),
+        (listener, "GET", "/api/v1/artists", None, 200),
+        (listener, "GET", "/api/v1/tracks", None, 200),
+        (listener, "GET", "/api/v1/genres", None, 200),
+        (listener, "GET", "/api/v1/playlists", None, 200),
+        (listener, "POST", "/api/v1/playlists", {"name": "Listener list"}, 201),
+        (uploader, "GET", "/api/v1/admin/users", None, 403),
+        (uploader, "GET", "/api/v1/roles", None, 403),
+        (manager, "GET", "/api/v1/roles", None, 200),
+        (manager, "GET", "/api/v1/admin/users", None, 200),
+        (manager, "POST", "/api/v1/admin/scan", None, 403),
+        (admin, "GET", "/api/v1/admin/users", None, 200),
+        (admin, "GET", "/api/v1/roles", None, 200),
+        (admin, "GET", "/api/v1/audit-log", None, 200),
+        (admin, "GET", "/api/v1/genres", None, 200),
+    ]
+    for opener, method, path, body, expected in matrix:
+        status, payload = call(opener, method, path, body)
+        expect(
+            status == expected,
+            f"{method} {path} expected {expected}, got {status}: {payload}",
+        )
+
     status, credentials = call(admin, "GET", "/api/v1/auth/subsonic")
     expect(status == 200 and credentials["password"], "subsonic credentials missing")
 

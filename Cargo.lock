@@ -1716,7 +1716,7 @@ dependencies = [
 [[package]]
 name = "mc-auth"
 version = "0.1.0"
-source = "git+ssh://git@github.com/moshms/core.git?tag=v0.3.3#f63dfdd64e1d383b6fc37fd4aa5a95827f03f5f3"
+source = "git+ssh://git@github.com/moshms/core.git?tag=v0.3.4#042bfe5d46acfee2559b11dd3da0807247a45a34"
 dependencies = [
  "argon2",
  "blake3",
@@ -1729,7 +1729,7 @@ dependencies = [
 [[package]]
 name = "mc-authz"
 version = "0.1.0"
-source = "git+ssh://git@github.com/moshms/core.git?tag=v0.3.3#f63dfdd64e1d383b6fc37fd4aa5a95827f03f5f3"
+source = "git+ssh://git@github.com/moshms/core.git?tag=v0.3.4#042bfe5d46acfee2559b11dd3da0807247a45a34"
 dependencies = [
  "serde",
 ]
@@ -1737,7 +1737,7 @@ dependencies = [
 [[package]]
 name = "mc-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/moshms/core.git?tag=v0.3.3#f63dfdd64e1d383b6fc37fd4aa5a95827f03f5f3"
+source = "git+ssh://git@github.com/moshms/core.git?tag=v0.3.4#042bfe5d46acfee2559b11dd3da0807247a45a34"
 dependencies = [
  "serde",
  "thiserror",
@@ -1747,7 +1747,7 @@ dependencies = [
 [[package]]
 name = "mc-crypto"
 version = "0.1.0"
-source = "git+ssh://git@github.com/moshms/core.git?tag=v0.3.3#f63dfdd64e1d383b6fc37fd4aa5a95827f03f5f3"
+source = "git+ssh://git@github.com/moshms/core.git?tag=v0.3.4#042bfe5d46acfee2559b11dd3da0807247a45a34"
 dependencies = [
  "base64 0.23.1",
  "chacha20poly1305",
@@ -1759,7 +1759,7 @@ dependencies = [
 [[package]]
 name = "mc-db"
 version = "0.1.0"
-source = "git+ssh://git@github.com/moshms/core.git?tag=v0.3.3#f63dfdd64e1d383b6fc37fd4aa5a95827f03f5f3"
+source = "git+ssh://git@github.com/moshms/core.git?tag=v0.3.4#042bfe5d46acfee2559b11dd3da0807247a45a34"
 dependencies = [
  "chrono",
  "mc-core",
@@ -1773,7 +1773,7 @@ dependencies = [
 [[package]]
 name = "mc-jobs"
 version = "0.1.0"
-source = "git+ssh://git@github.com/moshms/core.git?tag=v0.3.3#f63dfdd64e1d383b6fc37fd4aa5a95827f03f5f3"
+source = "git+ssh://git@github.com/moshms/core.git?tag=v0.3.4#042bfe5d46acfee2559b11dd3da0807247a45a34"
 dependencies = [
  "mc-core",
  "mc-db",
@@ -1786,7 +1786,7 @@ dependencies = [
 [[package]]
 name = "mc-media"
 version = "0.1.0"
-source = "git+ssh://git@github.com/moshms/core.git?tag=v0.3.3#f63dfdd64e1d383b6fc37fd4aa5a95827f03f5f3"
+source = "git+ssh://git@github.com/moshms/core.git?tag=v0.3.4#042bfe5d46acfee2559b11dd3da0807247a45a34"
 dependencies = [
  "blake3",
  "lofty",
@@ -1797,7 +1797,7 @@ dependencies = [
 [[package]]
 name = "mc-proto"
 version = "0.1.0"
-source = "git+ssh://git@github.com/moshms/core.git?tag=v0.3.3#f63dfdd64e1d383b6fc37fd4aa5a95827f03f5f3"
+source = "git+ssh://git@github.com/moshms/core.git?tag=v0.3.4#042bfe5d46acfee2559b11dd3da0807247a45a34"
 dependencies = [
  "prost",
  "protoc-bin-vendored",
@@ -1809,7 +1809,7 @@ dependencies = [
 [[package]]
 name = "mc-runtime"
 version = "0.1.0"
-source = "git+ssh://git@github.com/moshms/core.git?tag=v0.3.3#f63dfdd64e1d383b6fc37fd4aa5a95827f03f5f3"
+source = "git+ssh://git@github.com/moshms/core.git?tag=v0.3.4#042bfe5d46acfee2559b11dd3da0807247a45a34"
 dependencies = [
  "mc-core",
  "mc-crypto",
@@ -1823,7 +1823,7 @@ dependencies = [
 [[package]]
 name = "mc-scanner"
 version = "0.1.0"
-source = "git+ssh://git@github.com/moshms/core.git?tag=v0.3.3#f63dfdd64e1d383b6fc37fd4aa5a95827f03f5f3"
+source = "git+ssh://git@github.com/moshms/core.git?tag=v0.3.4#042bfe5d46acfee2559b11dd3da0807247a45a34"
 dependencies = [
  "blake3",
  "futures-util",
@@ -1834,6 +1834,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "tempfile",
+ "tokio",
  "tracing",
  "uuid",
 ]
@@ -1841,7 +1843,7 @@ dependencies = [
 [[package]]
 name = "mc-storage"
 version = "0.1.0"
-source = "git+ssh://git@github.com/moshms/core.git?tag=v0.3.3#f63dfdd64e1d383b6fc37fd4aa5a95827f03f5f3"
+source = "git+ssh://git@github.com/moshms/core.git?tag=v0.3.4#042bfe5d46acfee2559b11dd3da0807247a45a34"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1858,7 +1860,7 @@ dependencies = [
 [[package]]
 name = "mc-telemetry"
 version = "0.1.0"
-source = "git+ssh://git@github.com/moshms/core.git?tag=v0.3.3#f63dfdd64e1d383b6fc37fd4aa5a95827f03f5f3"
+source = "git+ssh://git@github.com/moshms/core.git?tag=v0.3.4#042bfe5d46acfee2559b11dd3da0807247a45a34"
 dependencies = [
  "async-trait",
  "axum",

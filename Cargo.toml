@@ -32,15 +32,15 @@ tower-http = { version = "0.6", features = ["trace", "timeout", "set-header"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v7", "serde"] }
 
-mc-auth = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.3" }
-mc-authz = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.3" }
-mc-core = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.3" }
-mc-crypto = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.3" }
-mc-db = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.3" }
-mc-jobs = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.3" }
-mc-media = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.3" }
-mc-proto = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.3" }
-mc-runtime = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.3" }
-mc-scanner = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.3" }
-mc-storage = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.3" }
-mc-telemetry = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.3", features = ["metrics"] }
+mc-auth = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.4" }
+mc-authz = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.4" }
+mc-core = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.4" }
+mc-crypto = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.4" }
+mc-db = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.4" }
+mc-jobs = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.4" }
+mc-media = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.4" }
+mc-proto = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.4" }
+mc-runtime = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.4" }
+mc-scanner = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.4" }
+mc-storage = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.4" }
+mc-telemetry = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.4", features = ["metrics"] }
