@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path as FsPath;
+use std::path::{Path as FsPath, PathBuf};
 
 use axum::body::Body;
 use axum::extract::{RawQuery, State};
@@ -18,6 +18,7 @@ use mc_storage::{Delivery, Key};
 use rand::seq::SliceRandom;
 use serde_json::{json, Map, Value};
 use subtle::ConstantTimeEq;
+use tokio::io::AsyncWriteExt;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
@@ -525,23 +526,45 @@ async fn stream_inner(
 
     let key = Key::new(track.file_key.as_str())?;
     let transcoder_local = matches!(storage.delivery(&key).await, Ok(Delivery::NginxInternal(_)));
-    if needs_transcode && transcoder_local && user.can(Permissions::TRANSCODE) {
+    if needs_transcode && user.can(Permissions::TRANSCODE) {
         if let Some(transcoder) = &state.transcoder {
             let format = requested_format.unwrap_or("mp3");
             let bitrate = max_bitrate.unwrap_or(128).clamp(32, 320);
-
-            match transcoder.transcode(&track.file_key, format, bitrate).await {
-                Ok(stream) => {
-                    return transcoded_response(
-                        stream,
-                        format,
-                        download,
-                        &track.file_key,
-                        &track.title,
-                    )
+            let staged = if transcoder_local {
+                None
+            } else {
+                match stage_transcode_source(state, storage.as_ref(), &key).await {
+                    Ok(path) => Some(path),
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to stage source for transcoding");
+                        None
+                    }
                 }
-                Err(error) => {
-                    tracing::warn!(%error, "transcoder unavailable, serving original");
+            };
+
+            if transcoder_local || staged.is_some() {
+                let source_path = staged
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned());
+                match transcoder
+                    .transcode(&track.file_key, source_path.as_deref(), format, bitrate)
+                    .await
+                {
+                    Ok(stream) => {
+                        return transcoded_response(
+                            stream,
+                            format,
+                            download,
+                            &track.file_key,
+                            &track.title,
+                        )
+                    }
+                    Err(error) => {
+                        if let Some(path) = staged {
+                            let _ = tokio::fs::remove_file(path).await;
+                        }
+                        tracing::warn!(%error, "transcoder unavailable, serving original");
+                    }
                 }
             }
         }
@@ -1034,6 +1057,49 @@ async fn authenticate(
         subsonic_secret: user.subsonic_secret,
         authz,
     })
+}
+
+async fn stage_transcode_source(
+    state: &AppState,
+    storage: &dyn mc_storage::Storage,
+    key: &Key,
+) -> mc_core::Result<PathBuf> {
+    let meta = storage.stat(key).await?;
+    let directory = state.staging_path.join("transcode");
+    tokio::fs::create_dir_all(&directory)
+        .await
+        .map_err(|error| CoreError::Unavailable(format!("create transcode staging: {error}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ =
+            tokio::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o777)).await;
+    }
+
+    let extension = FsPath::new(key.as_str())
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("bin");
+    let path = directory.join(format!("{}.{}", Uuid::now_v7(), extension));
+    let mut file = tokio::fs::File::create(&path)
+        .await
+        .map_err(|error| CoreError::Unavailable(format!("create transcode source: {error}")))?;
+
+    const CHUNK: u64 = 4 * 1024 * 1024;
+    let mut offset = 0;
+    while offset < meta.size {
+        let end = (offset + CHUNK).min(meta.size);
+        let bytes = storage.read_range(key, offset..end).await?;
+        file.write_all(&bytes)
+            .await
+            .map_err(|error| CoreError::Unavailable(format!("write transcode source: {error}")))?;
+        offset = end;
+    }
+    file.flush()
+        .await
+        .map_err(|error| CoreError::Unavailable(format!("flush transcode source: {error}")))?;
+
+    Ok(path)
 }
 
 fn decode_password(value: &str) -> Result<String, SubsonicError> {

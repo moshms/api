@@ -45,6 +45,7 @@ impl TranscoderClient {
     pub async fn transcode(
         &self,
         source_key: &str,
+        source_path: Option<&str>,
         format: &str,
         bitrate_kbps: u32,
     ) -> Result<Streaming<TranscodeChunk>> {
@@ -55,6 +56,8 @@ impl TranscoderClient {
                 source_key: source_key.to_owned(),
                 format: format.to_owned(),
                 bitrate_kbps,
+                source_path: source_path.unwrap_or_default().to_owned(),
+                cleanup_source: source_path.is_some(),
             })
             .await
             .map_err(|status| CoreError::Unavailable(format!("transcoder: {status}")))?;
