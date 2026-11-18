@@ -3,10 +3,13 @@ use std::path::{Path as FsPath, PathBuf};
 
 use axum::body::Body;
 use axum::extract::{RawQuery, State};
-use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
-use axum::http::{HeaderName, HeaderValue, StatusCode};
+use axum::http::header::{
+    ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE,
+};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::Json;
+use bytes::Bytes;
 use mc_authz::Permissions;
 use mc_core::CoreError;
 use mc_db::repos::annotations::{self, ItemType};
@@ -18,8 +21,10 @@ use mc_storage::{Delivery, Key};
 use rand::seq::SliceRandom;
 use serde_json::{json, Map, Value};
 use subtle::ConstantTimeEq;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
+use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
@@ -203,17 +208,25 @@ pub async fn search3(State(state): State<AppState>, RawQuery(raw): RawQuery) -> 
     finish(&params, search3_inner(&state, &params).await)
 }
 
-pub async fn stream(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
+pub async fn stream(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
     let params = SubsonicParams::from_raw(raw.as_deref());
-    match stream_inner(&state, &params, false).await {
+    match stream_inner(&state, &params, &headers, false).await {
         Ok(response) => response,
         Err(error) => respond(&params, error_value(error)),
     }
 }
 
-pub async fn download(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
+pub async fn download(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
     let params = SubsonicParams::from_raw(raw.as_deref());
-    match stream_inner(&state, &params, true).await {
+    match stream_inner(&state, &params, &headers, true).await {
         Ok(response) => response,
         Err(error) => respond(&params, error_value(error)),
     }
@@ -490,6 +503,7 @@ async fn search3_inner(state: &AppState, params: &SubsonicParams) -> Result<Valu
 async fn stream_inner(
     state: &AppState,
     params: &SubsonicParams,
+    headers: &HeaderMap,
     download: bool,
 ) -> Result<Response, SubsonicError> {
     let user = authenticate(state, params).await?;
@@ -527,9 +541,23 @@ async fn stream_inner(
     let key = Key::new(track.file_key.as_str())?;
     let transcoder_local = matches!(storage.delivery(&key).await, Ok(Delivery::NginxInternal(_)));
     if needs_transcode && user.can(Permissions::TRANSCODE) {
+        let format = requested_format.unwrap_or("mp3");
+        let bitrate = max_bitrate.unwrap_or(128).clamp(32, 320);
+        let cache_path = transcode_cache_path(state, track.id, format, bitrate);
+        if let Some(response) = cached_transcode_response(
+            &cache_path,
+            transcoder_content_type(format),
+            download,
+            &track.file_key,
+            &track.title,
+            headers,
+        )
+        .await?
+        {
+            return Ok(response);
+        }
+
         if let Some(transcoder) = &state.transcoder {
-            let format = requested_format.unwrap_or("mp3");
-            let bitrate = max_bitrate.unwrap_or(128).clamp(32, 320);
             let staged = if transcoder_local {
                 None
             } else {
@@ -551,8 +579,9 @@ async fn stream_inner(
                     .await
                 {
                     Ok(stream) => {
-                        return transcoded_response(
+                        return transcoded_response_cached(
                             stream,
+                            cache_path,
                             format,
                             download,
                             &track.file_key,
@@ -1405,28 +1434,203 @@ fn param_usize(params: &SubsonicParams, key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-fn transcoded_response(
-    stream: tonic::Streaming<TranscodeChunk>,
+fn transcode_cache_path(
+    state: &AppState,
+    track_id: Uuid,
+    format: &str,
+    bitrate: u32,
+) -> std::path::PathBuf {
+    let format = format.to_ascii_lowercase();
+    let extension = match format.as_str() {
+        "opus" | "ogg" => "ogg",
+        "aac" | "m4a" => "m4a",
+        _ => "mp3",
+    };
+    state
+        .staging_path
+        .join("transcode-cache")
+        .join(format!("{track_id}-{format}-{bitrate}.{extension}"))
+}
+
+async fn cached_transcode_response(
+    path: &FsPath,
+    content_type: &str,
+    download: bool,
+    file_key: &str,
+    title: &str,
+    headers: &HeaderMap,
+) -> Result<Option<Response>, SubsonicError> {
+    let Ok(metadata) = tokio::fs::metadata(path).await else {
+        return Ok(None);
+    };
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Ok(None);
+    }
+
+    let total = metadata.len();
+    let requested = headers.get(RANGE).and_then(|value| value.to_str().ok());
+    let range = match parse_byte_range(requested, total) {
+        Ok(range) => range,
+        Err(()) => {
+            let mut response = StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+            response.headers_mut().insert(
+                CONTENT_RANGE,
+                HeaderValue::from_str(&format!("bytes */{total}"))
+                    .map_err(|_| SubsonicError::internal())?,
+            );
+            return Ok(Some(response));
+        }
+    };
+    let (start, end) = range.unwrap_or((0, total - 1));
+    let length = end - start + 1;
+
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|_| SubsonicError::internal())?;
+    file.seek(SeekFrom::Start(start))
+        .await
+        .map_err(|_| SubsonicError::internal())?;
+    let stream = ReaderStream::new(file.take(length));
+    let mut response = Response::new(Body::from_stream(stream));
+    let status = if range.is_some() {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    };
+    *response.status_mut() = status;
+
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_str(content_type).map_err(|_| SubsonicError::internal())?,
+    );
+    response.headers_mut().insert(
+        CONTENT_LENGTH,
+        HeaderValue::from_str(&length.to_string()).map_err(|_| SubsonicError::internal())?,
+    );
+    response
+        .headers_mut()
+        .insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    if range.is_some() {
+        response.headers_mut().insert(
+            CONTENT_RANGE,
+            HeaderValue::from_str(&format!("bytes {start}-{end}/{total}"))
+                .map_err(|_| SubsonicError::internal())?,
+        );
+    }
+    if download {
+        response.headers_mut().insert(
+            CONTENT_DISPOSITION,
+            HeaderValue::from_str(&content_disposition(file_key, title))
+                .map_err(|_| SubsonicError::internal())?,
+        );
+    }
+
+    Ok(Some(response))
+}
+
+fn parse_byte_range(header: Option<&str>, size: u64) -> Result<Option<(u64, u64)>, ()> {
+    let Some(header) = header else {
+        return Ok(None);
+    };
+    let value = header.strip_prefix("bytes=").ok_or(())?;
+    if value.contains(',') {
+        return Err(());
+    }
+    let (start, end) = value.split_once('-').ok_or(())?;
+    if start.is_empty() {
+        let suffix = end.parse::<u64>().map_err(|_| ())?;
+        if suffix == 0 || size == 0 {
+            return Err(());
+        }
+        return Ok(Some((size.saturating_sub(suffix), size - 1)));
+    }
+    let start = start.parse::<u64>().map_err(|_| ())?;
+    if start >= size {
+        return Err(());
+    }
+    let end = if end.is_empty() {
+        size - 1
+    } else {
+        end.parse::<u64>().map_err(|_| ())?.min(size - 1)
+    };
+    if end < start {
+        return Err(());
+    }
+
+    Ok(Some((start, end)))
+}
+
+fn transcoded_response_cached(
+    mut stream: tonic::Streaming<TranscodeChunk>,
+    cache_path: std::path::PathBuf,
     format: &str,
     download: bool,
     file_key: &str,
     title: &str,
 ) -> Result<Response, SubsonicError> {
     let content_type = transcoder_content_type(format);
-    let stream = stream.map(|item| {
-        item.map(|chunk| chunk.data)
-            .map_err(|status| std::io::Error::other(status.message()))
-    });
-    let mut response = Response::new(Body::from_stream(stream));
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let key = file_key.to_owned();
+    let title = title.to_owned();
+    let cache_dir = cache_path.parent().map(FsPath::to_path_buf);
 
+    tokio::spawn(async move {
+        if let Some(directory) = cache_dir {
+            let _ = tokio::fs::create_dir_all(&directory).await;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ =
+                    tokio::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o777))
+                        .await;
+            }
+        }
+
+        let temporary = cache_path.with_extension(format!("part-{}", Uuid::now_v7()));
+        let mut file = tokio::fs::File::create(&temporary).await.ok();
+        let mut cache_ok = file.is_some();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(chunk) => {
+                    if let Some(handle) = &mut file {
+                        if handle.write_all(&chunk.data).await.is_err() {
+                            cache_ok = false;
+                            file = None;
+                        }
+                    }
+                    if tx.send(Ok(Bytes::from(chunk.data))).await.is_err() {
+                        cache_ok = false;
+                        break;
+                    }
+                }
+                Err(status) => {
+                    let _ = tx.send(Err(std::io::Error::other(status.message()))).await;
+                    cache_ok = false;
+                    break;
+                }
+            }
+        }
+        if let Some(mut handle) = file {
+            let _ = handle.flush().await;
+        }
+        if cache_ok {
+            let _ = tokio::fs::rename(&temporary, &cache_path).await;
+        } else {
+            let _ = tokio::fs::remove_file(&temporary).await;
+        }
+    });
+
+    let mut response = Response::new(Body::from_stream(ReceiverStream::new(rx)));
     response
         .headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
-
+    response
+        .headers_mut()
+        .insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     if download {
         response.headers_mut().insert(
             CONTENT_DISPOSITION,
-            HeaderValue::from_str(&content_disposition(file_key, title))
+            HeaderValue::from_str(&content_disposition(&key, &title))
                 .map_err(|_| SubsonicError::internal())?,
         );
     }
