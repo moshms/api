@@ -19,6 +19,10 @@ mod uploads;
 
 use std::sync::Arc;
 use std::time::Duration;
+
+use axum::body::{to_bytes, Body};
+use axum::http::Method;
+use axum::middleware;
 use std::time::Instant;
 
 use anyhow::Context;
@@ -218,7 +222,10 @@ async fn main() -> anyhow::Result<()> {
     let health = health_router(pool);
     let api = api_router(state);
 
-    let app = health.merge(api).layer(TraceLayer::new_for_http());
+    let app = health
+        .merge(api)
+        .layer(middleware::from_fn(rest_post_to_query))
+        .layer(TraceLayer::new_for_http());
     let app = if config.metrics {
         app.layer(axum::middleware::from_fn(metrics_middleware))
     } else {
@@ -318,6 +325,7 @@ fn api_router(state: AppState) -> Router {
                 .delete(playlists::delete),
         )
         .route("/api/v1/playlists/{id}/m3u", get(playlists::m3u))
+        .route("/api/v1/playlists/{id}/order", put(playlists::reorder))
         .route("/api/v1/playlists/{id}/tracks", post(playlists::add_track))
         .route(
             "/api/v1/playlists/{id}/tracks/{position}",
@@ -338,6 +346,8 @@ fn api_router(state: AppState) -> Router {
         )
         .route("/api/v1/admin/scan", post(scan))
         .route("/api/v1/admin/scan/async", post(scan_async))
+        .route("/api/v1/admin/stats", get(admin::stats))
+        .route("/api/v1/admin/scan/events", get(admin::scan_events))
         .route(
             "/api/v1/admin/storages",
             get(admin::list_storages).post(admin::create_storage),
@@ -402,55 +412,212 @@ fn api_router(state: AppState) -> Router {
             "/api/v1/playlists/{id}/permissions/{target_type}/{target_id}",
             put(permissions::playlist_set).delete(permissions::playlist_delete),
         )
-        .route("/rest/ping", get(subsonic::ping))
-        .route("/rest/ping.view", get(subsonic::ping))
-        .route("/rest/getLicense", get(subsonic::get_license))
-        .route("/rest/getLicense.view", get(subsonic::get_license))
-        .route("/rest/getMusicFolders", get(subsonic::get_music_folders))
+        .route("/rest/ping", get(subsonic::ping).post(subsonic::ping))
+        .route("/rest/ping.view", get(subsonic::ping).post(subsonic::ping))
+        .route(
+            "/rest/getLicense",
+            get(subsonic::get_license).post(subsonic::get_license),
+        )
+        .route(
+            "/rest/getLicense.view",
+            get(subsonic::get_license).post(subsonic::get_license),
+        )
+        .route(
+            "/rest/getMusicFolders",
+            get(subsonic::get_music_folders).post(subsonic::get_music_folders),
+        )
         .route(
             "/rest/getMusicFolders.view",
-            get(subsonic::get_music_folders),
+            get(subsonic::get_music_folders).post(subsonic::get_music_folders),
         )
-        .route("/rest/getIndexes", get(subsonic::get_indexes))
-        .route("/rest/getIndexes.view", get(subsonic::get_indexes))
-        .route("/rest/getArtists", get(subsonic::get_artists))
-        .route("/rest/getArtists.view", get(subsonic::get_artists))
-        .route("/rest/getArtist", get(subsonic::get_artist))
-        .route("/rest/getArtist.view", get(subsonic::get_artist))
-        .route("/rest/getAlbum", get(subsonic::get_album))
-        .route("/rest/getAlbum.view", get(subsonic::get_album))
-        .route("/rest/getAlbumList2", get(subsonic::get_album_list2))
-        .route("/rest/getAlbumList2.view", get(subsonic::get_album_list2))
-        .route("/rest/getSong", get(subsonic::get_song))
-        .route("/rest/getSong.view", get(subsonic::get_song))
-        .route("/rest/search3", get(subsonic::search3))
-        .route("/rest/search3.view", get(subsonic::search3))
-        .route("/rest/stream", get(subsonic::stream))
-        .route("/rest/stream.view", get(subsonic::stream))
-        .route("/rest/download", get(subsonic::download))
-        .route("/rest/download.view", get(subsonic::download))
-        .route("/rest/getCoverArt", get(subsonic::get_cover_art))
-        .route("/rest/getCoverArt.view", get(subsonic::get_cover_art))
-        .route("/rest/star", get(subsonic::star))
-        .route("/rest/star.view", get(subsonic::star))
-        .route("/rest/unstar", get(subsonic::unstar))
-        .route("/rest/unstar.view", get(subsonic::unstar))
-        .route("/rest/scrobble", get(subsonic::scrobble))
-        .route("/rest/scrobble.view", get(subsonic::scrobble))
-        .route("/rest/getPlaylists", get(subsonic::get_playlists))
-        .route("/rest/getPlaylists.view", get(subsonic::get_playlists))
-        .route("/rest/getPlaylist", get(subsonic::get_playlist))
-        .route("/rest/getPlaylist.view", get(subsonic::get_playlist))
-        .route("/rest/createPlaylist", get(subsonic::create_playlist))
-        .route("/rest/createPlaylist.view", get(subsonic::create_playlist))
-        .route("/rest/updatePlaylist", get(subsonic::update_playlist))
-        .route("/rest/updatePlaylist.view", get(subsonic::update_playlist))
-        .route("/rest/deletePlaylist", get(subsonic::delete_playlist))
-        .route("/rest/deletePlaylist.view", get(subsonic::delete_playlist))
-        .route("/rest/getPlayQueue", get(subsonic::get_play_queue))
-        .route("/rest/getPlayQueue.view", get(subsonic::get_play_queue))
-        .route("/rest/savePlayQueue", get(subsonic::save_play_queue))
-        .route("/rest/savePlayQueue.view", get(subsonic::save_play_queue))
+        .route(
+            "/rest/getIndexes",
+            get(subsonic::get_indexes).post(subsonic::get_indexes),
+        )
+        .route(
+            "/rest/getIndexes.view",
+            get(subsonic::get_indexes).post(subsonic::get_indexes),
+        )
+        .route(
+            "/rest/getArtists",
+            get(subsonic::get_artists).post(subsonic::get_artists),
+        )
+        .route(
+            "/rest/getArtists.view",
+            get(subsonic::get_artists).post(subsonic::get_artists),
+        )
+        .route(
+            "/rest/getArtist",
+            get(subsonic::get_artist).post(subsonic::get_artist),
+        )
+        .route(
+            "/rest/getArtist.view",
+            get(subsonic::get_artist).post(subsonic::get_artist),
+        )
+        .route(
+            "/rest/getAlbum",
+            get(subsonic::get_album).post(subsonic::get_album),
+        )
+        .route(
+            "/rest/getAlbum.view",
+            get(subsonic::get_album).post(subsonic::get_album),
+        )
+        .route(
+            "/rest/getAlbumList2",
+            get(subsonic::get_album_list2).post(subsonic::get_album_list2),
+        )
+        .route(
+            "/rest/getAlbumList2.view",
+            get(subsonic::get_album_list2).post(subsonic::get_album_list2),
+        )
+        .route(
+            "/rest/getStarred2",
+            get(subsonic::get_starred2).post(subsonic::get_starred2),
+        )
+        .route(
+            "/rest/getStarred2.view",
+            get(subsonic::get_starred2).post(subsonic::get_starred2),
+        )
+        .route(
+            "/rest/getAlbumList",
+            get(subsonic::get_album_list).post(subsonic::get_album_list),
+        )
+        .route(
+            "/rest/getAlbumList.view",
+            get(subsonic::get_album_list).post(subsonic::get_album_list),
+        )
+        .route(
+            "/rest/getRandomSongs",
+            get(subsonic::get_random_songs).post(subsonic::get_random_songs),
+        )
+        .route(
+            "/rest/getRandomSongs.view",
+            get(subsonic::get_random_songs).post(subsonic::get_random_songs),
+        )
+        .route(
+            "/rest/getLyrics",
+            get(subsonic::get_lyrics).post(subsonic::get_lyrics),
+        )
+        .route(
+            "/rest/getLyrics.view",
+            get(subsonic::get_lyrics).post(subsonic::get_lyrics),
+        )
+        .route(
+            "/rest/getNowPlaying",
+            get(subsonic::get_now_playing).post(subsonic::get_now_playing),
+        )
+        .route(
+            "/rest/getNowPlaying.view",
+            get(subsonic::get_now_playing).post(subsonic::get_now_playing),
+        )
+        .route(
+            "/rest/getSong",
+            get(subsonic::get_song).post(subsonic::get_song),
+        )
+        .route(
+            "/rest/getSong.view",
+            get(subsonic::get_song).post(subsonic::get_song),
+        )
+        .route(
+            "/rest/search3",
+            get(subsonic::search3).post(subsonic::search3),
+        )
+        .route(
+            "/rest/search3.view",
+            get(subsonic::search3).post(subsonic::search3),
+        )
+        .route("/rest/stream", get(subsonic::stream).post(subsonic::stream))
+        .route(
+            "/rest/stream.view",
+            get(subsonic::stream).post(subsonic::stream),
+        )
+        .route(
+            "/rest/download",
+            get(subsonic::download).post(subsonic::download),
+        )
+        .route(
+            "/rest/download.view",
+            get(subsonic::download).post(subsonic::download),
+        )
+        .route(
+            "/rest/getCoverArt",
+            get(subsonic::get_cover_art).post(subsonic::get_cover_art),
+        )
+        .route(
+            "/rest/getCoverArt.view",
+            get(subsonic::get_cover_art).post(subsonic::get_cover_art),
+        )
+        .route("/rest/star", get(subsonic::star).post(subsonic::star))
+        .route("/rest/star.view", get(subsonic::star).post(subsonic::star))
+        .route("/rest/unstar", get(subsonic::unstar).post(subsonic::unstar))
+        .route(
+            "/rest/unstar.view",
+            get(subsonic::unstar).post(subsonic::unstar),
+        )
+        .route(
+            "/rest/scrobble",
+            get(subsonic::scrobble).post(subsonic::scrobble),
+        )
+        .route(
+            "/rest/scrobble.view",
+            get(subsonic::scrobble).post(subsonic::scrobble),
+        )
+        .route(
+            "/rest/getPlaylists",
+            get(subsonic::get_playlists).post(subsonic::get_playlists),
+        )
+        .route(
+            "/rest/getPlaylists.view",
+            get(subsonic::get_playlists).post(subsonic::get_playlists),
+        )
+        .route(
+            "/rest/getPlaylist",
+            get(subsonic::get_playlist).post(subsonic::get_playlist),
+        )
+        .route(
+            "/rest/getPlaylist.view",
+            get(subsonic::get_playlist).post(subsonic::get_playlist),
+        )
+        .route(
+            "/rest/createPlaylist",
+            get(subsonic::create_playlist).post(subsonic::create_playlist),
+        )
+        .route(
+            "/rest/createPlaylist.view",
+            get(subsonic::create_playlist).post(subsonic::create_playlist),
+        )
+        .route(
+            "/rest/updatePlaylist",
+            get(subsonic::update_playlist).post(subsonic::update_playlist),
+        )
+        .route(
+            "/rest/updatePlaylist.view",
+            get(subsonic::update_playlist).post(subsonic::update_playlist),
+        )
+        .route(
+            "/rest/deletePlaylist",
+            get(subsonic::delete_playlist).post(subsonic::delete_playlist),
+        )
+        .route(
+            "/rest/deletePlaylist.view",
+            get(subsonic::delete_playlist).post(subsonic::delete_playlist),
+        )
+        .route(
+            "/rest/getPlayQueue",
+            get(subsonic::get_play_queue).post(subsonic::get_play_queue),
+        )
+        .route(
+            "/rest/getPlayQueue.view",
+            get(subsonic::get_play_queue).post(subsonic::get_play_queue),
+        )
+        .route(
+            "/rest/savePlayQueue",
+            get(subsonic::save_play_queue).post(subsonic::save_play_queue),
+        )
+        .route(
+            "/rest/savePlayQueue.view",
+            get(subsonic::save_play_queue).post(subsonic::save_play_queue),
+        )
         .with_state(state)
 }
 
@@ -622,4 +789,26 @@ async fn shutdown_signal() {
     }
 
     info!("shutdown signal received");
+}
+
+async fn rest_post_to_query(request: Request, next: Next) -> Response {
+    if request.method() != Method::POST || !request.uri().path().starts_with("/rest/") {
+        return next.run(request).await;
+    }
+
+    let (mut parts, body) = request.into_parts();
+    let Ok(bytes) = to_bytes(body, 1024 * 1024).await else {
+        return axum::http::StatusCode::BAD_REQUEST.into_response();
+    };
+    if !bytes.is_empty() {
+        let mut query = parts.uri.query().unwrap_or("").to_owned();
+        if !query.is_empty() {
+            query.push('&');
+        }
+        query.push_str(&String::from_utf8_lossy(&bytes));
+        if let Ok(uri) = format!("{}?{}", parts.uri.path(), query).parse() {
+            parts.uri = uri;
+        }
+    }
+    next.run(Request::from_parts(parts, Body::empty())).await
 }
