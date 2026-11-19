@@ -11,7 +11,9 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::Json;
 use mc_authz::Permissions;
+use mc_db::repos::annotations;
 use mc_db::repos::catalog;
+use mc_db::repos::history;
 use mc_db::repos::libraries::{self, LibraryRecord};
 use mc_storage::{Delivery, Key};
 use serde::Deserialize;
@@ -74,6 +76,12 @@ pub struct GenresQuery {
 pub struct ArtworkQuery {
     #[serde(default)]
     pub size: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct HistoryQuery {
+    #[serde(default)]
+    pub limit: Option<i64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -231,6 +239,38 @@ fn paginated<T: serde::Serialize>(
     }
 
     response
+}
+
+pub async fn history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HistoryQuery>,
+) -> Result<Json<Vec<history::PlayHistoryEntry>>, ApiError> {
+    let user = auth::authenticate(&state, &headers).await?;
+    let visible = user.visible_library_ids();
+    let limit = query.limit.unwrap_or(100).clamp(1, 200);
+
+    Ok(Json(
+        history::recent(&state.pool, user.id, &visible, limit).await?,
+    ))
+}
+
+pub async fn scrobble(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    let user = auth::authenticate(&state, &headers).await?;
+    let visible = user.visible_library_ids();
+    let track = catalog::get_track(&state.pool, id, &visible)
+        .await?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "track not found"))?;
+    if !user.can_library(track.library_id, Permissions::LIBRARY_VIEW) {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "track not found"));
+    }
+    annotations::scrobble(&state.pool, user.id, id, true).await?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn album_zip(

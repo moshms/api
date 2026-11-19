@@ -298,6 +298,8 @@ fn api_router(state: AppState) -> Router {
         .route("/api/v1/albums", get(catalog::albums))
         .route("/api/v1/albums/{id}", get(catalog::album))
         .route("/api/v1/albums/{id}/download", get(catalog::album_zip))
+        .route("/api/v1/history", get(catalog::history))
+        .route("/api/v1/tracks/{id}/scrobble", post(catalog::scrobble))
         .route("/api/v1/tracks", get(catalog::tracks))
         .route("/api/v1/genres", get(catalog::genres))
         .route("/api/v1/tracks/{id}", get(catalog::track))
@@ -315,6 +317,7 @@ fn api_router(state: AppState) -> Router {
                 .patch(playlists::update)
                 .delete(playlists::delete),
         )
+        .route("/api/v1/playlists/{id}/m3u", get(playlists::m3u))
         .route("/api/v1/playlists/{id}/tracks", post(playlists::add_track))
         .route(
             "/api/v1/playlists/{id}/tracks/{position}",

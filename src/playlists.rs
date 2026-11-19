@@ -1,5 +1,6 @@
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use mc_authz::Permissions;
 use mc_db::repos::catalog;
@@ -25,12 +26,16 @@ pub struct PlaylistDetailDto {
 #[derive(Debug, Deserialize)]
 pub struct CreatePlaylistRequest {
     pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct UpdatePlaylistRequest {
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
     #[serde(default)]
     pub is_public: Option<bool>,
 }
@@ -77,7 +82,8 @@ pub async fn create(
 ) -> Result<(StatusCode, Json<PlaylistDetailDto>), ApiError> {
     let user = auth::require_permission(&state, &headers, Permissions::PLAYLIST_CREATE).await?;
     let name = validate_name(&request.name)?;
-    let id = playlists::create(&state.pool, user.id, name, &[]).await?;
+    let description = request.description.as_deref().unwrap_or("").trim();
+    let id = playlists::create(&state.pool, user.id, name, description, &[]).await?;
     let detail = load_detail(&state, &user, id).await?;
 
     Ok((StatusCode::CREATED, Json(detail)))
@@ -98,7 +104,17 @@ pub async fn update(
     }
 
     let name = request.name.as_deref().map(validate_name).transpose()?;
-    let updated = playlists::update(&state.pool, id, name, request.is_public, &[], &[]).await?;
+    let description = request.description.as_deref().map(str::trim);
+    let updated = playlists::update(
+        &state.pool,
+        id,
+        name,
+        description,
+        request.is_public,
+        &[],
+        &[],
+    )
+    .await?;
 
     if !updated {
         return Err(playlist_not_found());
@@ -193,7 +209,8 @@ pub async fn add_track(
         return Err(ApiError::new(StatusCode::NOT_FOUND, "track not found"));
     }
 
-    let updated = playlists::update(&state.pool, id, None, None, &[request.track_id], &[]).await?;
+    let updated =
+        playlists::update(&state.pool, id, None, None, None, &[request.track_id], &[]).await?;
 
     if !updated {
         return Err(playlist_not_found());
@@ -215,7 +232,7 @@ pub async fn remove_track(
         return Err(ApiError::new(StatusCode::FORBIDDEN, "permission denied"));
     }
 
-    let updated = playlists::update(&state.pool, id, None, None, &[], &[position]).await?;
+    let updated = playlists::update(&state.pool, id, None, None, None, &[], &[position]).await?;
 
     if !updated {
         return Err(playlist_not_found());
@@ -245,6 +262,47 @@ async fn load_detail(
         hidden_count: detail.hidden_count,
         permissions: access.bits(),
     })
+}
+
+pub async fn m3u(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Response, ApiError> {
+    let user = auth::authenticate(&state, &headers).await?;
+    let playlist = load_record(&state, &user, id).await?;
+    let access = playlist_permissions(&state, &user, &playlist).await?;
+    if !access.can_view_playlist() {
+        return Err(playlist_not_found());
+    }
+    let visible = user.visible_library_ids();
+    let detail = playlists::get(&state.pool, id, &visible)
+        .await?
+        .ok_or_else(playlist_not_found)?;
+
+    let mut output = String::from("#EXTM3U\n");
+    for track in &detail.tracks {
+        let seconds = track.duration_ms.unwrap_or(0) / 1000;
+        output.push_str(&format!(
+            "#EXTINF:{seconds},{} - {}\n/api/v1/stream/{}\n",
+            track.artist.as_deref().unwrap_or("Unknown Artist"),
+            track.title,
+            track.id
+        ));
+    }
+
+    let mut response = output.into_response();
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("audio/x-mpegurl"),
+    );
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_DISPOSITION,
+        axum::http::HeaderValue::from_str(&format!("attachment; filename=\"playlist-{}.m3u\"", id))
+            .map_err(|_| ApiError::internal("invalid m3u filename"))?,
+    );
+
+    Ok(response)
 }
 
 async fn load_record(
