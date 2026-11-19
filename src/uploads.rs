@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -237,6 +238,72 @@ pub async fn patch(
         ));
     }
 
+    let content_length = header(&headers, "content-length")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    if offset == 0 && content_length == size {
+        let library = libraries::get(&state.pool, upload.library_id)
+            .await?
+            .ok_or_else(|| CoreError::not_found("library", upload.library_id))?;
+        let storage = state
+            .registry
+            .read()
+            .await
+            .storage_for_library(library.id)
+            .ok_or_else(|| CoreError::Unavailable("library storage is unavailable".to_owned()))?;
+
+        if storage.local_path(&Key::root()).is_none() {
+            let filename = sanitize_filename(&upload.filename);
+            let mut stream = body.into_data_stream();
+            let first = stream
+                .next()
+                .await
+                .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "empty upload body"))?
+                .map_err(|error| {
+                    ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        format!("read upload body: {error}"),
+                    )
+                })?;
+            validate_audio_header(&filename, &first)?;
+            let key = choose_upload_key(storage.as_ref(), &upload, &filename).await?;
+            let counter = Arc::new(AtomicU64::new(0));
+            let count = counter.clone();
+            let mapped = futures_util::stream::once(async move { Ok::<_, CoreError>(first) })
+                .chain(stream.map(move |item| {
+                    item.map_err(|error| {
+                        CoreError::Unavailable(format!("read upload body: {error}"))
+                    })
+                }))
+                .map(move |item| {
+                    if let Ok(bytes) = &item {
+                        count.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                    }
+                    item
+                });
+            storage.write_stream(&key, Box::pin(mapped)).await?;
+            if counter.load(Ordering::Relaxed) != size {
+                let _ = storage.delete(&key).await;
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "upload body size does not match Upload-Length",
+                ));
+            }
+            let _ = tokio::fs::remove_file(state.staging_path.join(&upload.staging_key)).await;
+            uploads::update_offset(
+                &state.pool,
+                upload.id,
+                i64::try_from(size).unwrap_or(i64::MAX),
+            )
+            .await?;
+            finish_direct(&state, &upload, library, storage, key).await?;
+
+            let mut response = StatusCode::NO_CONTENT.into_response();
+            insert_tus_headers(&mut response, Some(size), Some(size), None);
+            return Ok(response);
+        }
+    }
+
     let staging_path = state.staging_path.join(&upload.staging_key);
     let mut file = tokio::fs::OpenOptions::new()
         .append(true)
@@ -414,30 +481,23 @@ const AUDIO_EXTENSIONS: &[&str] = &[
     "wv",
 ];
 
-async fn validate_audio_file(path: &Path, filename: &str) -> Result<()> {
+fn audio_extension(filename: &str) -> Result<String> {
     let extension = Path::new(filename)
         .extension()
         .and_then(|value| value.to_str())
         .map(str::to_ascii_lowercase)
         .ok_or_else(|| CoreError::Validation("upload must have an audio extension".to_owned()))?;
-
     if !AUDIO_EXTENSIONS.contains(&extension.as_str()) {
         return Err(CoreError::Validation(format!(
             "unsupported audio extension: {extension}"
         )));
     }
 
-    let mut file = tokio::fs::File::open(path)
-        .await
-        .map_err(|error| CoreError::Unavailable(format!("open upload: {error}")))?;
-    let mut header = [0u8; 16];
-    let read = file
-        .read(&mut header)
-        .await
-        .map_err(|error| CoreError::Unavailable(format!("read upload header: {error}")))?;
-    let header = &header[..read];
+    Ok(extension)
+}
 
-    let matches = match extension.as_str() {
+fn audio_header_matches(extension: &str, header: &[u8]) -> bool {
+    match extension {
         "mp3" => {
             header.starts_with(b"ID3") || header.first().is_some_and(|byte| byte & 0xE0 == 0xE0)
         }
@@ -450,9 +510,31 @@ async fn validate_audio_file(path: &Path, filename: &str) -> Result<()> {
         "aif" | "aiff" => header.starts_with(b"FORM"),
         "wv" => header.starts_with(b"wvpk"),
         _ => false,
-    };
+    }
+}
 
-    if !matches {
+fn validate_audio_header(filename: &str, header: &[u8]) -> Result<()> {
+    let extension = audio_extension(filename)?;
+    if !audio_header_matches(&extension, header) {
+        return Err(CoreError::Validation(
+            "uploaded file does not match its audio format".to_owned(),
+        ));
+    }
+
+    Ok(())
+}
+
+async fn validate_audio_file(path: &Path, filename: &str) -> Result<()> {
+    let extension = audio_extension(filename)?;
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|error| CoreError::Unavailable(format!("open upload: {error}")))?;
+    let mut header = [0u8; 16];
+    let read = file
+        .read(&mut header)
+        .await
+        .map_err(|error| CoreError::Unavailable(format!("read upload header: {error}")))?;
+    if !audio_header_matches(&extension, &header[..read]) {
         return Err(CoreError::Validation(
             "uploaded file does not match its audio format".to_owned(),
         ));
@@ -477,6 +559,78 @@ async fn stream_staging(
     Ok(())
 }
 
+async fn choose_upload_key(
+    storage: &dyn mc_storage::Storage,
+    upload: &UploadRecord,
+    filename: &str,
+) -> Result<Key> {
+    let mut key = Key::new(format!("uploads/{}/{}", upload.user_id, filename))?;
+    match storage.stat(&key).await {
+        Ok(_) => {
+            key = Key::new(format!(
+                "uploads/{}/{}-{}",
+                upload.user_id, upload.id, filename
+            ))?;
+        }
+        Err(CoreError::NotFound { .. }) => {}
+        Err(error) => return Err(error),
+    }
+
+    Ok(key)
+}
+
+fn spawn_upload_scan(
+    state: &AppState,
+    library: mc_db::repos::libraries::LibraryRecord,
+    storage: Arc<dyn mc_storage::Storage>,
+    key: Key,
+    user_id: Uuid,
+) {
+    let scanner = state.scanner.clone();
+    let pool = state.pool.clone();
+    let library_id = library.id;
+    let library_name = library.name.clone();
+    let key_string = key.as_str().to_owned();
+    let scan_mode = ScanMode::Paths(vec![key]);
+    tokio::spawn(async move {
+        match scanner.scan_library(&library, storage, scan_mode).await {
+            Ok(stats) => {
+                if let Err(error) =
+                    media_files::set_uploaded_by(&pool, library_id, &key_string, user_id).await
+                {
+                    tracing::warn!(%error, "failed to record uploader on media file");
+                }
+                tracing::info!(library = %library_name, ?stats, "upload scan finished")
+            }
+            Err(error) => {
+                tracing::error!(library = %library_name, %error, "upload scan failed")
+            }
+        }
+    });
+}
+
+async fn finish_direct(
+    state: &AppState,
+    upload: &UploadRecord,
+    library: mc_db::repos::libraries::LibraryRecord,
+    storage: Arc<dyn mc_storage::Storage>,
+    key: Key,
+) -> Result<()> {
+    uploads::finish(&state.pool, upload.id, "complete", None).await?;
+    let payload = serde_json::json!({
+        "upload_id": upload.id,
+        "library_id": upload.library_id,
+        "source_key": key.as_str(),
+        "filename": upload.filename,
+    });
+    if let Err(error) = mc_jobs::enqueue(&state.pool, "import", payload).await {
+        tracing::warn!(%error, "failed to enqueue import job");
+    }
+    spawn_upload_scan(state, library, storage, key, upload.user_id);
+
+    Ok(())
+}
+
 async fn finalize(state: &AppState, upload: &UploadRecord) -> Result<Key> {
     let library = libraries::get(&state.pool, upload.library_id)
         .await?
@@ -491,18 +645,7 @@ async fn finalize(state: &AppState, upload: &UploadRecord) -> Result<Key> {
     let filename = sanitize_filename(&upload.filename);
     let staging_path = state.staging_path.join(&upload.staging_key);
     validate_audio_file(&staging_path, &filename).await?;
-    let mut key = Key::new(format!("uploads/{}/{}", upload.user_id, filename))?;
-
-    match storage.stat(&key).await {
-        Ok(_) => {
-            key = Key::new(format!(
-                "uploads/{}/{}-{}",
-                upload.user_id, upload.id, filename
-            ))?;
-        }
-        Err(CoreError::NotFound { .. }) => {}
-        Err(error) => return Err(error),
-    }
+    let key = choose_upload_key(storage.as_ref(), upload, &filename).await?;
 
     if let Some(destination) = storage.local_path(&key) {
         if let Some(parent) = destination.parent() {
@@ -525,29 +668,7 @@ async fn finalize(state: &AppState, upload: &UploadRecord) -> Result<Key> {
         result?;
     }
 
-    let scanner = state.scanner.clone();
-    let storage = storage.clone();
-    let library_name = library.name.clone();
-    let pool = state.pool.clone();
-    let library_id = library.id;
-    let key_string = key.as_str().to_owned();
-    let scan_mode = ScanMode::Paths(vec![key.clone()]);
-    let user_id = upload.user_id;
-    tokio::spawn(async move {
-        match scanner.scan_library(&library, storage, scan_mode).await {
-            Ok(stats) => {
-                if let Err(error) =
-                    media_files::set_uploaded_by(&pool, library_id, &key_string, user_id).await
-                {
-                    tracing::warn!(%error, "failed to record uploader on media file");
-                }
-                tracing::info!(library = %library_name, ?stats, "upload scan finished")
-            }
-            Err(error) => {
-                tracing::error!(library = %library_name, %error, "upload scan failed")
-            }
-        }
-    });
+    spawn_upload_scan(state, library, storage, key.clone(), upload.user_id);
 
     Ok(key)
 }

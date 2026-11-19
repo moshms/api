@@ -301,12 +301,18 @@ fn api_router(state: AppState) -> Router {
                 .delete(uploads::delete),
         )
         .route("/api/v1/artists", get(catalog::artists))
+        .route("/api/v1/artists/{id}", get(catalog::artist))
+        .route(
+            "/api/v1/artists/{id}/artwork",
+            get(catalog::artist_artwork).put(catalog::set_artist_artwork),
+        )
         .route("/api/v1/artists/{id}/tracks", get(catalog::artist_tracks))
         .route("/api/v1/albums", get(catalog::albums))
         .route("/api/v1/albums/{id}", get(catalog::album))
         .route("/api/v1/albums/{id}/download", get(catalog::album_zip))
         .route("/api/v1/history", get(catalog::history))
         .route("/api/v1/tracks/{id}/scrobble", post(catalog::scrobble))
+        .route("/api/v1/tracks/{id}/lyrics", get(catalog::track_lyrics))
         .route("/api/v1/tracks", get(catalog::tracks))
         .route("/api/v1/genres", get(catalog::genres))
         .route("/api/v1/tracks/{id}", get(catalog::track))
