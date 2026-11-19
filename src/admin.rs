@@ -1,5 +1,6 @@
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::Json;
 use mc_authz::Permissions;
 use mc_core::Role;
@@ -9,10 +10,13 @@ use mc_db::repos::permissions;
 use mc_db::repos::roles;
 use mc_db::repos::storages::{self, StorageRecord};
 use mc_db::repos::users::{self, UserSummary};
+use mc_db::repos::{scan_runs, stats};
 use mc_storage::Key;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::PgConnection;
+use std::convert::Infallible;
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::auth::{self, RoleDto};
@@ -676,6 +680,35 @@ fn parse_role(value: &str) -> Result<Role, ApiError> {
             "role must be admin, uploader or listener",
         )
     })
+}
+
+pub async fn stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<stats::AdminStats>, ApiError> {
+    auth::require_permission(&state, &headers, Permissions::RUN_SCANS).await?;
+    Ok(Json(stats::admin(&state.pool).await?))
+}
+
+pub async fn scan_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    auth::require_permission(&state, &headers, Permissions::RUN_SCANS).await?;
+    let pool = state.pool.clone();
+    let stream = futures_util::stream::unfold((), move |_| {
+        let pool = pool.clone();
+        async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let runs = scan_runs::recent(&pool, 20).await.unwrap_or_default();
+            let event = Event::default()
+                .json_data(runs)
+                .unwrap_or_else(|_| Event::default().data("[]"));
+            Some((Ok::<_, Infallible>(event), ()))
+        }
+    });
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
 pub async fn list_jobs(

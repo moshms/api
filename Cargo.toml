@@ -33,15 +33,15 @@ tower-http = { version = "0.6", features = ["trace", "timeout", "set-header"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v7", "serde"] }
 
-mc-auth = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.6" }
-mc-authz = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.6" }
-mc-core = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.6" }
-mc-crypto = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.6" }
-mc-db = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.6" }
-mc-jobs = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.6" }
-mc-media = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.6" }
-mc-proto = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.6" }
-mc-runtime = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.6" }
-mc-scanner = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.6" }
-mc-storage = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.6" }
-mc-telemetry = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.6", features = ["metrics"] }
+mc-auth = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.10" }
+mc-authz = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.10" }
+mc-core = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.10" }
+mc-crypto = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.10" }
+mc-db = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.10" }
+mc-jobs = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.10" }
+mc-media = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.10" }
+mc-proto = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.10" }
+mc-runtime = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.10" }
+mc-scanner = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.10" }
+mc-storage = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.10" }
+mc-telemetry = { git = "ssh://git@github.com/moshms/core.git", tag = "v0.3.10", features = ["metrics"] }

@@ -45,6 +45,11 @@ pub struct AddTrackRequest {
     pub track_id: Uuid,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ReorderPlaylistRequest {
+    pub track_ids: Vec<Uuid>,
+}
+
 pub async fn list(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -184,6 +189,24 @@ pub async fn delete(
     )
     .await?;
 
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn reorder(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(request): Json<ReorderPlaylistRequest>,
+) -> Result<StatusCode, ApiError> {
+    let user = auth::authenticate(&state, &headers).await?;
+    let playlist = load_record(&state, &user, id).await?;
+    let access = playlist_permissions(&state, &user, &playlist).await?;
+    if !access.contains(Permissions::PLAYLIST_MANAGE) {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "permission denied"));
+    }
+    if !playlists::reorder(&state.pool, id, &request.track_ids).await? {
+        return Err(playlist_not_found());
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

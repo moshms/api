@@ -13,9 +13,11 @@ use bytes::Bytes;
 use mc_authz::Permissions;
 use mc_core::CoreError;
 use mc_db::repos::annotations::{self, ItemType};
-use mc_db::repos::catalog::{self, AlbumSummary, ArtistSummary, TrackDetail, TrackSummary};
+use mc_db::repos::catalog::{
+    self, AlbumSummary, ArtistSummary, TrackDetail, TrackFilters, TrackSummary,
+};
 use mc_db::repos::playlists::{self, PlaylistRecord};
-use mc_db::repos::{play_queue, users};
+use mc_db::repos::{history, play_queue, users};
 use mc_proto::transcoder::TranscodeChunk;
 use mc_storage::{Delivery, Key};
 use rand::seq::SliceRandom;
@@ -196,6 +198,31 @@ pub async fn get_album(State(state): State<AppState>, RawQuery(raw): RawQuery) -
 pub async fn get_album_list2(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
     let params = SubsonicParams::from_raw(raw.as_deref());
     finish(&params, get_album_list2_inner(&state, &params).await)
+}
+
+pub async fn get_starred2(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
+    let params = SubsonicParams::from_raw(raw.as_deref());
+    finish(&params, get_starred2_inner(&state, &params).await)
+}
+
+pub async fn get_album_list(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
+    let params = SubsonicParams::from_raw(raw.as_deref());
+    finish(&params, get_album_list_inner(&state, &params).await)
+}
+
+pub async fn get_random_songs(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
+    let params = SubsonicParams::from_raw(raw.as_deref());
+    finish(&params, get_random_songs_inner(&state, &params).await)
+}
+
+pub async fn get_lyrics(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
+    let params = SubsonicParams::from_raw(raw.as_deref());
+    finish(&params, get_lyrics_inner(&state, &params).await)
+}
+
+pub async fn get_now_playing(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
+    let params = SubsonicParams::from_raw(raw.as_deref());
+    finish(&params, get_now_playing_inner(&state, &params).await)
 }
 
 pub async fn get_song(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
@@ -439,6 +466,129 @@ async fn get_album_list2_inner(
         .collect::<Vec<_>>();
 
     Ok(json!({ "albumList2": { "album": selected } }))
+}
+
+async fn get_starred2_inner(
+    state: &AppState,
+    params: &SubsonicParams,
+) -> Result<Value, SubsonicError> {
+    let user = authenticate(state, params).await?;
+    let visible = user.visible_library_ids();
+    let tracks = catalog::starred_tracks(&state.pool, user.id, &visible).await?;
+    let albums = catalog::starred_albums(&state.pool, user.id, &visible).await?;
+    let artists = catalog::starred_artists(&state.pool, user.id, &visible).await?;
+
+    Ok(json!({
+        "starred2": {
+            "artist": artists.iter().map(artist_json).collect::<Vec<_>>(),
+            "album": albums.iter().map(album_json).collect::<Vec<_>>(),
+            "song": tracks.iter().map(song_json).collect::<Vec<_>>(),
+        }
+    }))
+}
+
+async fn get_album_list_inner(
+    state: &AppState,
+    params: &SubsonicParams,
+) -> Result<Value, SubsonicError> {
+    let user = authenticate(state, params).await?;
+    let visible = user.visible_library_ids();
+    let kind = params.get("type").unwrap_or("alphabeticalByName");
+    let offset = param_usize(params, "offset", 0);
+    let size = param_usize(params, "size", 10).clamp(1, 500);
+    let mut albums = catalog::list_albums(&state.pool, None, &visible).await?;
+
+    match kind {
+        "newest" | "recent" => albums.sort_by(|left, right| {
+            right
+                .year
+                .cmp(&left.year)
+                .then_with(|| left.title.to_lowercase().cmp(&right.title.to_lowercase()))
+        }),
+        "alphabeticalByArtist" => albums.sort_by(|left, right| {
+            left.album_artist
+                .to_lowercase()
+                .cmp(&right.album_artist.to_lowercase())
+                .then_with(|| left.year.cmp(&right.year))
+                .then_with(|| left.title.to_lowercase().cmp(&right.title.to_lowercase()))
+        }),
+        "random" => albums.shuffle(&mut rand::thread_rng()),
+        _ => albums.sort_by_key(|album| album.title.to_lowercase()),
+    }
+
+    let selected = albums
+        .iter()
+        .skip(offset)
+        .take(size)
+        .map(album_json)
+        .collect::<Vec<_>>();
+
+    Ok(json!({ "albumList": { "album": selected } }))
+}
+
+async fn get_random_songs_inner(
+    state: &AppState,
+    params: &SubsonicParams,
+) -> Result<Value, SubsonicError> {
+    let user = authenticate(state, params).await?;
+    let visible = user.visible_library_ids();
+    let size = param_usize(params, "size", 10).clamp(1, 500);
+    let mut tracks = catalog::list_tracks_page(
+        &state.pool,
+        &visible,
+        TrackFilters::default(),
+        Some(
+            i64::try_from(size.saturating_mul(4))
+                .unwrap_or(500)
+                .min(500),
+        ),
+        0,
+    )
+    .await?;
+    tracks.shuffle(&mut rand::thread_rng());
+    tracks.truncate(size);
+
+    Ok(json!({
+        "randomSongs": {
+            "song": tracks.iter().map(song_json).collect::<Vec<_>>(),
+        }
+    }))
+}
+
+async fn get_lyrics_inner(
+    state: &AppState,
+    params: &SubsonicParams,
+) -> Result<Value, SubsonicError> {
+    let _user = authenticate(state, params).await?;
+    Ok(json!({
+        "lyrics": {
+            "artist": params.get("artist").unwrap_or(""),
+            "title": params.get("title").unwrap_or(""),
+            "value": "",
+        }
+    }))
+}
+
+async fn get_now_playing_inner(
+    state: &AppState,
+    params: &SubsonicParams,
+) -> Result<Value, SubsonicError> {
+    let user = authenticate(state, params).await?;
+    let visible = user.visible_library_ids();
+    let tracks = history::now_playing(&state.pool, &visible, 5, 50).await?;
+    let entries = tracks
+        .iter()
+        .map(|track| {
+            let summary = TrackSummary::from(track);
+            json!({
+                "song": song_json(&summary),
+                "minutesAgo": 0,
+                "playerId": 0,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(json!({ "nowPlaying": { "entry": entries } }))
 }
 
 async fn get_song_inner(state: &AppState, params: &SubsonicParams) -> Result<Value, SubsonicError> {
