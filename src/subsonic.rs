@@ -827,7 +827,7 @@ async fn create_playlist_inner(
         }
 
         let updated =
-            playlists::update(&state.pool, playlist_id, name, None, &song_ids, &[]).await?;
+            playlists::update(&state.pool, playlist_id, name, None, None, &song_ids, &[]).await?;
 
         if !updated {
             return Err(SubsonicError::not_found("Playlist"));
@@ -841,7 +841,7 @@ async fn create_playlist_inner(
     }
 
     let name = name.ok_or_else(|| SubsonicError::missing("name"))?;
-    let id = playlists::create(&state.pool, user.id, name, &song_ids).await?;
+    let id = playlists::create(&state.pool, user.id, name, "", &song_ids).await?;
 
     Ok(json!({ "playlist": { "id": id.to_string() } }))
 }
@@ -900,8 +900,16 @@ async fn update_playlist_inner(
         }
     }
 
-    let updated =
-        playlists::update(&state.pool, playlist_id, name, is_public, &add, &remove).await?;
+    let updated = playlists::update(
+        &state.pool,
+        playlist_id,
+        name,
+        None,
+        is_public,
+        &add,
+        &remove,
+    )
+    .await?;
 
     if !updated {
         return Err(SubsonicError::not_found("Playlist"));
