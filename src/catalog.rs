@@ -1,6 +1,7 @@
 use std::path::Path as FsPath;
 
 use axum::body::Body;
+use base64::Engine;
 
 use axum::extract::{Path, Query, State};
 use axum::http::header::{
@@ -15,6 +16,7 @@ use mc_db::repos::annotations;
 use mc_db::repos::catalog;
 use mc_db::repos::history;
 use mc_db::repos::libraries::{self, LibraryRecord};
+use mc_db::repos::{artists, artworks, tracks};
 use mc_storage::{Delivery, Key};
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
@@ -76,6 +78,18 @@ pub struct GenresQuery {
 pub struct ArtworkQuery {
     #[serde(default)]
     pub size: Option<u32>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct LyricsResponse {
+    pub source: &'static str,
+    pub lyrics: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ArtworkUploadRequest {
+    pub artwork_base64: String,
+    pub artwork_mime: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -271,6 +285,197 @@ pub async fn scrobble(
     annotations::scrobble(&state.pool, user.id, id, true).await?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn artist(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<catalog::ArtistDetail>, ApiError> {
+    let user = auth::authenticate(&state, &headers).await?;
+    let visible = user.visible_library_ids();
+    catalog::get_artist(&state.pool, id, &visible)
+        .await?
+        .map(Json)
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "artist not found"))
+}
+
+pub async fn artist_artwork(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Response, ApiError> {
+    let user = auth::authenticate(&state, &headers).await?;
+    let visible = user.visible_library_ids();
+    let artwork = catalog::get_artist_artwork(&state.pool, id, &visible)
+        .await?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "artwork not found"))?;
+    let etag = format!("\"{}\"", artwork.etag);
+
+    if headers
+        .get(IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        == Some(etag.as_str())
+    {
+        let mut response = StatusCode::NOT_MODIFIED.into_response();
+        response.headers_mut().insert(
+            ETAG,
+            HeaderValue::from_str(&etag).map_err(|_| ApiError::internal("invalid artwork etag"))?,
+        );
+        return Ok(response);
+    }
+
+    let mut response = artwork.data.into_response();
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_str(&artwork.mime)
+            .map_err(|_| ApiError::internal("invalid artwork type"))?,
+    );
+    response.headers_mut().insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=86400"),
+    );
+    response.headers_mut().insert(
+        ETAG,
+        HeaderValue::from_str(&etag).map_err(|_| ApiError::internal("invalid artwork etag"))?,
+    );
+
+    Ok(response)
+}
+
+pub async fn set_artist_artwork(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(request): Json<ArtworkUploadRequest>,
+) -> Result<StatusCode, ApiError> {
+    let user = auth::authenticate(&state, &headers).await?;
+    let can_edit = user.is_admin()
+        || user
+            .authz
+            .libraries
+            .iter()
+            .any(|library| library.permissions.contains(Permissions::LIBRARY_EDIT_TAGS));
+    if !can_edit {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "permission denied"));
+    }
+    let visible = user.visible_library_ids();
+    if catalog::get_artist(&state.pool, id, &visible)
+        .await?
+        .is_none()
+    {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "artist not found"));
+    }
+    if !request.artwork_mime.starts_with("image/") {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "artwork_mime must be an image type",
+        ));
+    }
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(&request.artwork_base64)
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid artwork_base64"))?;
+    if data.len() > 10 * 1024 * 1024 {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "artwork must be smaller than 10 MiB",
+        ));
+    }
+    let hash = blake3::hash(&data).to_hex().to_string();
+    let artwork_id = artworks::upsert(
+        &state.pool,
+        &artworks::NewArtwork {
+            hash: &hash,
+            source: "artist",
+            mime: &request.artwork_mime,
+            data: &data,
+        },
+    )
+    .await?;
+    if !artists::set_artwork(&state.pool, id, Some(artwork_id)).await? {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "artist not found"));
+    }
+    if let Ok(mut cache) = state.artwork_cache.lock() {
+        cache.clear();
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn track_lyrics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<LyricsResponse>, ApiError> {
+    let user = auth::authenticate(&state, &headers).await?;
+    let visible = user.visible_library_ids();
+    let track = catalog::get_track(&state.pool, id, &visible)
+        .await?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "track not found"))?;
+
+    if let Some(lyrics) = track
+        .lyrics
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+    {
+        return Ok(Json(LyricsResponse {
+            source: "embedded",
+            lyrics: Some(lyrics),
+        }));
+    }
+
+    if let Some(lyrics) = fetch_lrclib(&track).await {
+        let _ = tracks::set_lyrics(&state.pool, track.id, &lyrics).await;
+        return Ok(Json(LyricsResponse {
+            source: "lrclib",
+            lyrics: Some(lyrics),
+        }));
+    }
+
+    Ok(Json(LyricsResponse {
+        source: "none",
+        lyrics: None,
+    }))
+}
+
+#[derive(serde::Deserialize)]
+struct LrcLibResult {
+    #[serde(rename = "plainLyrics")]
+    plain_lyrics: Option<String>,
+}
+
+async fn fetch_lrclib(track: &catalog::TrackDetail) -> Option<String> {
+    let artist = track.artist.as_deref().or(track.album_artist.as_deref())?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(6))
+        .build()
+        .ok()?;
+    let mut query = vec![
+        ("artist_name", artist.to_owned()),
+        ("track_name", track.title.clone()),
+    ];
+    if let Some(album) = &track.album {
+        query.push(("album_name", album.clone()));
+    }
+    if let Some(duration) = track.duration_ms {
+        query.push(("duration", (duration / 1000).to_string()));
+    }
+    let response = client
+        .get("https://lrclib.net/api/search")
+        .query(&query)
+        .header("User-Agent", "MusicCloud/0.5 (self-hosted)")
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let results = response.json::<Vec<LrcLibResult>>().await.ok()?;
+    results
+        .into_iter()
+        .find_map(|result| result.plain_lyrics)
+        .filter(|lyrics| !lyrics.trim().is_empty())
 }
 
 pub async fn album_zip(

@@ -9,7 +9,6 @@ use axum::http::header::{
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::Json;
-use bytes::Bytes;
 use mc_authz::Permissions;
 use mc_core::CoreError;
 use mc_db::repos::annotations::{self, ItemType};
@@ -24,7 +23,6 @@ use rand::seq::SliceRandom;
 use serde_json::{json, Map, Value};
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
-use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
@@ -729,14 +727,21 @@ async fn stream_inner(
                     .await
                 {
                     Ok(stream) => {
-                        return transcoded_response_cached(
-                            stream,
-                            cache_path,
-                            format,
+                        if let Err(_error) = fill_transcode_cache(stream, cache_path.clone()).await
+                        {
+                            tracing::warn!("failed to fill transcode cache");
+                        } else if let Some(response) = cached_transcode_response(
+                            &cache_path,
+                            transcoder_content_type(format),
                             download,
                             &track.file_key,
                             &track.title,
+                            headers,
                         )
+                        .await?
+                        {
+                            return Ok(response);
+                        }
                     }
                     Err(error) => {
                         if let Some(path) = staged {
@@ -1718,82 +1723,45 @@ fn parse_byte_range(header: Option<&str>, size: u64) -> Result<Option<(u64, u64)
     Ok(Some((start, end)))
 }
 
-fn transcoded_response_cached(
+async fn fill_transcode_cache(
     mut stream: tonic::Streaming<TranscodeChunk>,
     cache_path: std::path::PathBuf,
-    format: &str,
-    download: bool,
-    file_key: &str,
-    title: &str,
-) -> Result<Response, SubsonicError> {
-    let content_type = transcoder_content_type(format);
-    let (tx, rx) = tokio::sync::mpsc::channel(8);
-    let key = file_key.to_owned();
-    let title = title.to_owned();
-    let cache_dir = cache_path.parent().map(FsPath::to_path_buf);
-
-    tokio::spawn(async move {
-        if let Some(directory) = cache_dir {
-            let _ = tokio::fs::create_dir_all(&directory).await;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ =
-                    tokio::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o777))
-                        .await;
-            }
+) -> Result<(), SubsonicError> {
+    if let Some(directory) = cache_path.parent() {
+        tokio::fs::create_dir_all(directory)
+            .await
+            .map_err(|_| SubsonicError::internal())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ =
+                tokio::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o777)).await;
         }
-
-        let temporary = cache_path.with_extension(format!("part-{}", Uuid::now_v7()));
-        let mut file = tokio::fs::File::create(&temporary).await.ok();
-        let mut cache_ok = file.is_some();
-        while let Some(item) = stream.next().await {
-            match item {
-                Ok(chunk) => {
-                    if let Some(handle) = &mut file {
-                        if handle.write_all(&chunk.data).await.is_err() {
-                            cache_ok = false;
-                            file = None;
-                        }
-                    }
-                    if tx.send(Ok(Bytes::from(chunk.data))).await.is_err() {
-                        cache_ok = false;
-                        break;
-                    }
-                }
-                Err(status) => {
-                    let _ = tx.send(Err(std::io::Error::other(status.message()))).await;
-                    cache_ok = false;
-                    break;
-                }
-            }
-        }
-        if let Some(mut handle) = file {
-            let _ = handle.flush().await;
-        }
-        if cache_ok {
-            let _ = tokio::fs::rename(&temporary, &cache_path).await;
-        } else {
-            let _ = tokio::fs::remove_file(&temporary).await;
-        }
-    });
-
-    let mut response = Response::new(Body::from_stream(ReceiverStream::new(rx)));
-    response
-        .headers_mut()
-        .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
-    response
-        .headers_mut()
-        .insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-    if download {
-        response.headers_mut().insert(
-            CONTENT_DISPOSITION,
-            HeaderValue::from_str(&content_disposition(&key, &title))
-                .map_err(|_| SubsonicError::internal())?,
-        );
     }
 
-    Ok(response)
+    let temporary = cache_path.with_extension(format!("part-{}", Uuid::now_v7()));
+    let mut file = tokio::fs::File::create(&temporary)
+        .await
+        .map_err(|_| SubsonicError::internal())?;
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(chunk) => {
+                file.write_all(&chunk.data)
+                    .await
+                    .map_err(|_| SubsonicError::internal())?;
+            }
+            Err(_) => {
+                let _ = tokio::fs::remove_file(&temporary).await;
+                return Err(SubsonicError::internal());
+            }
+        }
+    }
+    file.flush().await.map_err(|_| SubsonicError::internal())?;
+    drop(file);
+    tokio::fs::rename(&temporary, &cache_path)
+        .await
+        .map_err(|_| SubsonicError::internal())?;
+    Ok(())
 }
 
 fn transcoder_content_type(format: &str) -> &'static str {
